@@ -17,9 +17,15 @@
 
 .keep-filter-container {
     display: flex;
-    justify-content: flex-end;
+    justify-content: space-between;
+    align-items: center;
     gap: 8px;
     margin-bottom: 24px;
+}
+
+.keep-filter-left {
+    display: flex;
+    gap: 8px;
 }
 
 .keep-filter-container .keep-select {
@@ -39,14 +45,38 @@
 }
 
 .keep-filter-container .keep-select:hover {
-    background-color: var(--background-modifier-hover);
     color: var(--text-muted);
 }
 
 .keep-filter-container .keep-select:focus:hover {
-    background-color: var(--background-modifier-hover);
     color: var(--text-muted);
 }
+
+.keep-create-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: 999px;
+    border: none;
+    background-color: transparent;
+    color: var(--text-normal);
+    cursor: pointer;
+    transition: background-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease;
+}
+
+.keep-create-button:hover {
+    background-color: var(--background-modifier-hover);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+.keep-create-button:active {
+    transform: translateY(1px);
+    box-shadow: none;
+}
+
 
 .keep-section-title {
     margin: 0 0 16px 0;
@@ -59,30 +89,6 @@
 
 .keep-section-title-others {
     margin-top: 24px;
-}
-
-.keep-create-container {
-    max-width: 600px;
-    margin: 0 auto 32px auto;
-}
-
-.keep-create-container .keep-create-input {
-    width: 75%;
-    height: 35px;
-    padding: 8px 6px 10px 16px;
-    border-radius: 8px;
-    border: 1px solid var(--background-modifier-border);
-    background-color: var(--background-primary-alt);
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
-    font-size: 1em;
-    cursor: text;
-    transition: box-shadow 0.2s ease;
-    display: block; 
-    margin: 0 auto;
-}
-
-.keep-create-input:hover {
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
 }
 
 .keep-grid {
@@ -144,6 +150,43 @@
     opacity: 1;
 }
 
+.keep-card .keep-delete-btn {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    background: transparent;
+    border: none;
+    outline: none;
+    box-shadow: none;
+    cursor: pointer;
+    opacity: 0;
+    padding: 6px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    transition:
+        opacity 0.2s ease,
+        color 0.2s ease,
+        background-color 0.2s ease;
+}
+
+.keep-card .keep-delete-btn:focus-visible,
+.keep-card .keep-delete-btn:focus {
+    outline: none;
+    box-shadow: none;
+}
+
+.keep-card .keep-delete-btn:hover {
+    background-color: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.keep-card:hover .keep-delete-btn {
+    opacity: 1;
+}
+
 .keep-card-title {
     margin: 0 0 8px 0;
     font-size: 1.1em;
@@ -184,15 +227,16 @@
 
 /* Modal Styles */
 .keep-modal-bg {
-    backdrop-filter: blur(8px);
-    background-color: rgba(0, 0, 0, 0.6) !important;
+    backdrop-filter: blur(14px);
+    background-color: rgba(0, 0, 0, 0.4) !important;
+    opacity: 1 !important;
 }
 
 .keep-editor-modal {
     width: 90vw !important;
-    height: 65vh !important;
+    height: 80vh !important;
     max-width: 700px !important;
-    max-height: 80vh !important;
+    max-height: 85vh !important;
     padding: 0 !important;
     overflow: hidden !important;
     border-radius: 12px !important;

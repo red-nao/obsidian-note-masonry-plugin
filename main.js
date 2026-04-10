@@ -105,23 +105,22 @@ var KeepView = class extends import_obsidian.ItemView {
     container.empty();
     container.addClass("keep-view-container");
     const filterContainer = container.createEl("div", { cls: "keep-filter-container" });
-    this.folderSelect = filterContainer.createEl("select", { cls: "keep-select" });
+    const leftFilters = filterContainer.createEl("div", { cls: "keep-filter-left" });
+    this.folderSelect = leftFilters.createEl("select", { cls: "keep-select" });
     this.folderSelect.addEventListener("change", (e) => {
       this.selectedFolder = e.target.value;
       this.requestRender();
     });
-    this.tagSelect = filterContainer.createEl("select", { cls: "keep-select" });
+    this.tagSelect = leftFilters.createEl("select", { cls: "keep-select" });
     this.tagSelect.addEventListener("change", (e) => {
       this.selectedTag = e.target.value;
       this.requestRender();
     });
-    const createContainer = container.createEl("div", { cls: "keep-create-container" });
-    const createInput = createContainer.createEl("input", {
-      type: "text",
-      placeholder: "Take a note...",
-      cls: "keep-create-input"
+    const createButton = filterContainer.createEl("button", {
+      cls: "keep-create-button"
     });
-    createInput.addEventListener("click", () => {
+    (0, import_obsidian.setIcon)(createButton, "plus");
+    createButton.addEventListener("click", () => {
       new NoteEditModal(this.app, null, this.leaf, () => this.requestRender()).open();
     });
     this.gridContainer = container.createEl("div", { cls: "keep-grid-wrapper" });
@@ -272,6 +271,20 @@ var KeepView = class extends import_obsidian.ItemView {
         await this.app.fileManager.processFrontMatter(file, (fm) => {
           fm.pinned = !isPinned;
         });
+      });
+      const deleteBtn = card.createEl("button", {
+        cls: "keep-delete-btn"
+      });
+      (0, import_obsidian.setIcon)(deleteBtn, "trash");
+      const deleteSvg = deleteBtn.querySelector("svg");
+      if (deleteSvg) {
+        deleteSvg.setAttribute("fill", "none");
+        deleteSvg.setAttribute("stroke", "currentColor");
+      }
+      deleteBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await this.app.vault.delete(file);
+        this.requestRender();
       });
       if (file.basename) {
         card.createEl("h3", { text: file.basename, cls: "keep-card-title" });

@@ -105,28 +105,29 @@ export class KeepView extends ItemView {
 
         const filterContainer = container.createEl('div', { cls: 'keep-filter-container' });
         
-        this.folderSelect = filterContainer.createEl('select', { cls: 'keep-select' });
+        const leftFilters = filterContainer.createEl('div', { cls: 'keep-filter-left' });
+    
+        this.folderSelect = leftFilters.createEl('select', { cls: 'keep-select' });
         this.folderSelect.addEventListener('change', (e) => {
             this.selectedFolder = (e.target as HTMLSelectElement).value;
             this.requestRender();
         });
-
-        this.tagSelect = filterContainer.createEl('select', { cls: 'keep-select' });
+    
+        this.tagSelect = leftFilters.createEl('select', { cls: 'keep-select' });
         this.tagSelect.addEventListener('change', (e) => {
             this.selectedTag = (e.target as HTMLSelectElement).value;
             this.requestRender();
         });
-
-        const createContainer = container.createEl('div', { cls: 'keep-create-container' });
-        const createInput = createContainer.createEl('input', {
-            type: 'text',
-            placeholder: 'Take a note...',
-            cls: 'keep-create-input'
+    
+        // 右端の plus ボタン
+        const createButton = filterContainer.createEl('button', {
+            cls: 'keep-create-button',
         });
-        createInput.addEventListener('click', () => {
+        setIcon(createButton, 'plus');
+        createButton.addEventListener('click', () => {
             new NoteEditModal(this.app, null, this.leaf, () => this.requestRender()).open();
         });
-
+    
         this.gridContainer = container.createEl('div', { cls: 'keep-grid-wrapper' });
 
         this.registerEvent(this.app.vault.on('create', () => this.requestRender()));
@@ -277,7 +278,6 @@ export class KeepView extends ItemView {
           
             const svg = pinBtn.querySelector('svg');
             if (svg) {
-                // まずは「線だけ」のアイコンにしておく
                 svg.setAttribute('fill', 'none');
                 svg.setAttribute('stroke', 'currentColor');
             }
@@ -287,7 +287,6 @@ export class KeepView extends ItemView {
             if (isPinned) {
                 pinBtn.addClass('is-pinned');
                 if (svg) {
-                    // ピン状態のときだけ中身を color で塗りつぶす
                     svg.setAttribute('fill', 'currentColor');
                 }
             }
@@ -299,6 +298,24 @@ export class KeepView extends ItemView {
                 });
             });
 
+            const deleteBtn = card.createEl('button', {
+                cls: 'keep-delete-btn',
+            });
+            setIcon(deleteBtn, 'trash'); // または 'trash-2' など好みのアイコン名
+            
+            const deleteSvg = deleteBtn.querySelector('svg');
+            if (deleteSvg) {
+                deleteSvg.setAttribute('fill', 'none');
+                deleteSvg.setAttribute('stroke', 'currentColor');
+            }
+            
+            deleteBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                await this.app.vault.delete(file);
+                this.requestRender();
+            });
+          
+          
             if (file.basename) {
                 card.createEl('h3', { text: file.basename, cls: 'keep-card-title' });
             }
