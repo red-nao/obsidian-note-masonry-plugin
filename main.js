@@ -45,6 +45,7 @@ var NoteEditModal = class extends import_obsidian.Modal {
       this.bgEl.addClass("keep-modal-bg");
     }
     this.contentEl.addClass("keep-editor-modal-content");
+    let isNewFile = false;
     if (!this.file) {
       let newPath = `Untitled.md`;
       let counter = 1;
@@ -53,6 +54,7 @@ var NoteEditModal = class extends import_obsidian.Modal {
         counter++;
       }
       this.file = await this.app.vault.create(newPath, "");
+      isNewFile = true;
     }
     const LeafConstructor = this.keepLeaf.constructor;
     this.editorLeaf = new LeafConstructor(this.app);
@@ -60,6 +62,26 @@ var NoteEditModal = class extends import_obsidian.Modal {
     this.contentEl.appendChild(leafEl);
     if (this.editorLeaf && this.file) {
       await this.editorLeaf.openFile(this.file);
+      if (isNewFile) {
+        setTimeout(() => {
+          const inlineTitle = this.contentEl.querySelector(".inline-title");
+          if (inlineTitle) {
+            inlineTitle.focus();
+            const range = document.createRange();
+            range.selectNodeContents(inlineTitle);
+            const sel = window.getSelection();
+            if (sel) {
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+          } else {
+            const headerTitle = this.contentEl.querySelector(".view-header-title");
+            if (headerTitle) {
+              headerTitle.click();
+            }
+          }
+        }, 150);
+      }
     }
   }
   onClose() {

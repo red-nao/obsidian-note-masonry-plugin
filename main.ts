@@ -23,6 +23,7 @@ class NoteEditModal extends Modal {
         }
         this.contentEl.addClass('keep-editor-modal-content');
 
+        let isNewFile = false;
         if (!this.file) {
             let newPath = `Untitled.md`;
             let counter = 1;
@@ -30,7 +31,8 @@ class NoteEditModal extends Modal {
                 newPath = `Untitled ${counter}.md`;
                 counter++;
             }
-            this.file = await this.app.vault.create(newPath, "");
+          this.file = await this.app.vault.create(newPath, "");
+          isNewFile = true;
         }
 
         // Create a detached leaf so it doesn't open a new tab in the workspace
@@ -43,6 +45,27 @@ class NoteEditModal extends Modal {
         
         if (this.editorLeaf && this.file) {
             await this.editorLeaf.openFile(this.file);
+        
+            if (isNewFile) {
+              setTimeout(() => {
+                  const inlineTitle = this.contentEl.querySelector('.inline-title') as HTMLElement;
+                  if (inlineTitle) {
+                      inlineTitle.focus();
+                      const range = document.createRange();
+                      range.selectNodeContents(inlineTitle);
+                      const sel = window.getSelection();
+                      if (sel) {
+                          sel.removeAllRanges();
+                          sel.addRange(range);
+                      }
+                  } else {
+                      const headerTitle = this.contentEl.querySelector('.view-header-title') as HTMLElement;
+                      if (headerTitle) {
+                          headerTitle.click();
+                      }
+                  }
+              }, 150);
+            }
         }
     }
 
