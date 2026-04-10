@@ -99,7 +99,7 @@ export class KeepView extends ItemView {
     }
 
     getDisplayText() {
-        return "Keep Notes";
+        return "Note Masonry";
     }
 
     getIcon() {
@@ -358,7 +358,7 @@ export class KeepView extends ItemView {
 export default class KeepPlugin extends Plugin {
     async onload() {
         this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
-        this.addRibbonIcon('layout-grid', 'Open Keep View', () => this.activateView());
+        this.addRibbonIcon('layout-grid', 'Open Note Masonry', () => this.activateView());
     }
 
     async activateView() {

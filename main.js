@@ -104,7 +104,7 @@ var KeepView = class extends import_obsidian.ItemView {
     return KEEP_VIEW_TYPE;
   }
   getDisplayText() {
-    return "Keep Notes";
+    return "Note Masonry";
   }
   getIcon() {
     return "layout-grid";
@@ -324,7 +324,7 @@ var KeepView = class extends import_obsidian.ItemView {
 var KeepPlugin = class extends import_obsidian.Plugin {
   async onload() {
     this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
-    this.addRibbonIcon("layout-grid", "Open Keep View", () => this.activateView());
+    this.addRibbonIcon("layout-grid", "Open Note Masonry", () => this.activateView());
   }
   async activateView() {
     const { workspace } = this.app;
