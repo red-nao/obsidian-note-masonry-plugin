@@ -31,12 +31,14 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var KEEP_VIEW_TYPE = "keep-view";
 var NoteEditModal = class extends import_obsidian.Modal {
-  constructor(app, file, keepLeaf, onCloseCallback) {
+  constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "") {
     super(app);
     this.editorLeaf = null;
     this.file = file;
     this.keepLeaf = keepLeaf;
     this.onCloseCallback = onCloseCallback;
+    this.selectedFolder = selectedFolder;
+    this.selectedTag = selectedTag;
   }
   async onOpen() {
     this.contentEl.empty();
@@ -47,13 +49,27 @@ var NoteEditModal = class extends import_obsidian.Modal {
     this.contentEl.addClass("keep-editor-modal-content");
     let isNewFile = false;
     if (!this.file) {
-      let newPath = `Untitled.md`;
+      const basePath = this.selectedFolder ? `${this.selectedFolder}/` : "";
+      let newPath = `${basePath}Untitled.md`;
       let counter = 1;
       while (this.app.vault.getAbstractFileByPath(newPath)) {
         newPath = `Untitled ${counter}.md`;
         counter++;
       }
       this.file = await this.app.vault.create(newPath, "");
+      if (this.selectedTag) {
+        await this.app.fileManager.processFrontMatter(this.file, (fm) => {
+          if (!fm.tags) {
+            fm.tags = [];
+          } else if (typeof fm.tags === "string") {
+            fm.tags = [fm.tags];
+          }
+          const cleanTag = this.selectedTag.replace(/^#/, "");
+          if (!fm.tags.includes(cleanTag)) {
+            fm.tags.push(cleanTag);
+          }
+        });
+      }
       isNewFile = true;
     }
     const LeafConstructor = this.keepLeaf.constructor;
@@ -143,7 +159,7 @@ var KeepView = class extends import_obsidian.ItemView {
     });
     (0, import_obsidian.setIcon)(createButton, "plus");
     createButton.addEventListener("click", () => {
-      new NoteEditModal(this.app, null, this.leaf, () => this.requestRender()).open();
+      new NoteEditModal(this.app, null, this.leaf, () => this.requestRender(), this.selectedFolder, this.selectedTag).open();
     });
     this.gridContainer = container.createEl("div", { cls: "keep-grid-wrapper" });
     this.registerEvent(this.app.vault.on("create", () => this.requestRender()));

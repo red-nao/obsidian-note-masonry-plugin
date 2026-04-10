@@ -7,12 +7,16 @@ class NoteEditModal extends Modal {
     keepLeaf: WorkspaceLeaf;
     editorLeaf: WorkspaceLeaf | null = null;
     onCloseCallback: () => void;
+    selectedFolder: string;
+    selectedTag: string;
 
-    constructor(app: App, file: TFile | null, keepLeaf: WorkspaceLeaf, onCloseCallback: () => void) {
+    constructor(app: App, file: TFile | null, keepLeaf: WorkspaceLeaf, onCloseCallback: () => void, selectedFolder: string = '', selectedTag: string = '') {
         super(app);
         this.file = file;
         this.keepLeaf = keepLeaf;
         this.onCloseCallback = onCloseCallback;
+        this.selectedFolder = selectedFolder;
+        this.selectedTag = selectedTag;
     }
 
     async onOpen() {
@@ -25,13 +29,29 @@ class NoteEditModal extends Modal {
 
         let isNewFile = false;
         if (!this.file) {
-            let newPath = `Untitled.md`;
+            const basePath = this.selectedFolder ? `${this.selectedFolder}/` : "";
+            let newPath = `${basePath}Untitled.md`;
             let counter = 1;
             while (this.app.vault.getAbstractFileByPath(newPath)) {
                 newPath = `Untitled ${counter}.md`;
                 counter++;
             }
           this.file = await this.app.vault.create(newPath, "");
+          
+          if (this.selectedTag) {
+              await this.app.fileManager.processFrontMatter(this.file, (fm) => {
+                  if (!fm.tags) {
+                      fm.tags = [];
+                  } else if (typeof fm.tags === "string") {
+                      fm.tags = [fm.tags];
+                  }
+                  const cleanTag = this.selectedTag.replace(/^#/, '');
+                  if (!fm.tags.includes(cleanTag)) {
+                      fm.tags.push(cleanTag);
+                  }
+              });
+          }
+          
           isNewFile = true;
         }
 
@@ -142,13 +162,12 @@ export class KeepView extends ItemView {
             this.requestRender();
         });
     
-        // 右端の plus ボタン
         const createButton = filterContainer.createEl('button', {
             cls: 'keep-create-button',
         });
         setIcon(createButton, 'plus');
         createButton.addEventListener('click', () => {
-            new NoteEditModal(this.app, null, this.leaf, () => this.requestRender()).open();
+            new NoteEditModal(this.app, null, this.leaf, () => this.requestRender(), this.selectedFolder, this.selectedTag).open();
         });
     
         this.gridContainer = container.createEl('div', { cls: 'keep-grid-wrapper' });
@@ -324,7 +343,7 @@ export class KeepView extends ItemView {
             const deleteBtn = card.createEl('button', {
                 cls: 'keep-delete-btn',
             });
-            setIcon(deleteBtn, 'trash'); // または 'trash-2' など好みのアイコン名
+            setIcon(deleteBtn, 'trash');
             
             const deleteSvg = deleteBtn.querySelector('svg');
             if (deleteSvg) {
