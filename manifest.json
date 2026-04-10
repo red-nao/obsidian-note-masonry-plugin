@@ -1,7 +1,7 @@
 {
     "id": "note-masonry",
     "name": "Note Masonry",
-    "version": "1.0.1",
+    "version": "1.0.3",
     "minAppVersion": "1.10.0",
     "description": "View and edit your markdown notes in a Google Keep style masonry layout.",
     "author": "rednao",
