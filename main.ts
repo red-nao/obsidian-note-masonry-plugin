@@ -153,12 +153,14 @@ export class KeepView extends ItemView {
         this.folderSelect = leftFilters.createEl('select', { cls: 'keep-select' });
         this.folderSelect.addEventListener('change', (e) => {
             this.selectedFolder = (e.target as HTMLSelectElement).value;
+            this.adjustSelectWidth(this.folderSelect); 
             this.requestRender();
         });
     
         this.tagSelect = leftFilters.createEl('select', { cls: 'keep-select' });
         this.tagSelect.addEventListener('change', (e) => {
             this.selectedTag = (e.target as HTMLSelectElement).value;
+            this.adjustSelectWidth(this.tagSelect);   
             this.requestRender();
         });
     
@@ -215,8 +217,35 @@ export class KeepView extends ItemView {
                 if (t === currentTag) option.selected = true;
             });
         }
+      
+        this.folderSelect.value = this.selectedFolder;
+        this.adjustSelectWidth(this.folderSelect);
+        
+        this.tagSelect.value = this.selectedTag;
+        this.adjustSelectWidth(this.tagSelect);
     }
 
+    adjustSelectWidth(select: HTMLSelectElement) {
+        if (!select || select.options.length === 0) return;
+        
+        const tempSpan = document.createElement('span');
+        tempSpan.style.visibility = 'hidden';
+        tempSpan.style.position = 'absolute';
+        tempSpan.style.whiteSpace = 'nowrap';
+        
+        const computedStyle = window.getComputedStyle(select);
+        tempSpan.style.fontSize = computedStyle.fontSize;
+        tempSpan.style.fontFamily = computedStyle.fontFamily;
+        
+        tempSpan.innerText = select.options[select.selectedIndex].text;
+        document.body.appendChild(tempSpan);
+        
+        const textWidth = tempSpan.getBoundingClientRect().width;
+        document.body.removeChild(tempSpan);
+        
+        select.style.width = `${textWidth + 20}px`;
+    }
+  
     async renderGrid() {
         if (this.isRendering) return;
         this.isRendering = true;
