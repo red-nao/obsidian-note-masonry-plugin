@@ -305,7 +305,7 @@ var KeepView = class extends import_obsidian.ItemView {
       }
       deleteBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
-        await this.app.vault.delete(file);
+        await this.app.vault.trash(file, true);
         this.requestRender();
       });
       if (file.basename) {
