@@ -22,8 +22,9 @@ class NoteEditModal extends Modal {
     async onOpen() {
         this.contentEl.empty();
         this.modalEl.addClass('keep-editor-modal');
-        if ((this as any).bgEl) {
-            (this as any).bgEl.addClass('keep-modal-bg');
+        const modal = this as Modal & { bgEl?: HTMLElement };
+        if (modal.bgEl) {
+            modal.bgEl.addClass('keep-modal-bg');
         }
         this.contentEl.addClass('keep-editor-modal-content');
 
@@ -55,12 +56,10 @@ class NoteEditModal extends Modal {
           isNewFile = true;
         }
 
-        // Create a detached leaf so it doesn't open a new tab in the workspace
-        const LeafConstructor = (this.keepLeaf as any).constructor;
+        const LeafConstructor = this.keepLeaf.constructor as new (app: App) => WorkspaceLeaf;
         this.editorLeaf = new LeafConstructor(this.app);
         
-        // Move the leaf's DOM element into our modal
-        const leafEl = (this.editorLeaf as any).containerEl as HTMLElement;
+        const leafEl = (this.editorLeaf as WorkspaceLeaf & { containerEl: HTMLElement }).containerEl;
         this.contentEl.appendChild(leafEl);
         
         if (this.editorLeaf && this.file) {
@@ -91,10 +90,8 @@ class NoteEditModal extends Modal {
 
     onClose() {
         if (this.editorLeaf) {
-            // Detach the background tab so it closes automatically
             this.editorLeaf.detach();
         }
-        // Return focus to the Keep View
         this.app.workspace.setActiveLeaf(this.keepLeaf, { focus: true });
         this.onCloseCallback();
     }
@@ -134,9 +131,9 @@ export class KeepView extends ItemView {
         };
     }
 
-    async setState(state: any, result: any) {
-        this.selectedFolder = state.selectedFolder || '';
-        this.selectedTag = state.selectedTag || '';
+    async setState(state: Record<string, unknown>, result: Parameters<ItemView['setState']>[1]) {
+        this.selectedFolder = typeof state.selectedFolder === 'string' ? state.selectedFolder : '';
+        this.selectedTag = typeof state.selectedTag === 'string' ? state.selectedTag : '';
         await super.setState(state, result);
         this.requestRender();
     }
@@ -180,7 +177,7 @@ export class KeepView extends ItemView {
         this.registerEvent(this.app.vault.on('rename', () => this.requestRender()));
         this.registerEvent(this.app.metadataCache.on('changed', () => this.requestRender()));
 
-        await this.renderGrid();
+        void this.renderGrid();
     }
 
     requestRender() {
@@ -188,7 +185,7 @@ export class KeepView extends ItemView {
             clearTimeout(this.renderTimeout);
         }
         this.renderTimeout = setTimeout(() => {
-            this.renderGrid();
+            void this.renderGrid();
         }, 300);
     }
 
@@ -200,7 +197,7 @@ export class KeepView extends ItemView {
         if (this.folderSelect.options.length !== folders.length + 1) {
             const currentFolder = this.selectedFolder;
             this.folderSelect.empty();
-            this.folderSelect.createEl('option', { value: '', text: 'All Folders' });
+            this.folderSelect.createEl('option', { value: '', text: 'All folders' });
             folders.forEach(f => {
                 if (f.path === '/') return;
                 const option = this.folderSelect.createEl('option', { value: f.path, text: f.path });
@@ -211,7 +208,7 @@ export class KeepView extends ItemView {
         if (this.tagSelect.options.length !== tags.length + 1) {
             const currentTag = this.selectedTag;
             this.tagSelect.empty();
-            this.tagSelect.createEl('option', { value: '', text: 'All Tags' });
+            this.tagSelect.createEl('option', { value: '', text: 'All tags' });
             tags.forEach(t => {
                 const option = this.tagSelect.createEl('option', { value: t, text: t });
                 if (t === currentTag) option.selected = true;
@@ -229,13 +226,17 @@ export class KeepView extends ItemView {
         if (!select || select.options.length === 0) return;
         
         const tempSpan = document.createElement('span');
-        tempSpan.style.visibility = 'hidden';
-        tempSpan.style.position = 'absolute';
-        tempSpan.style.whiteSpace = 'nowrap';
+        tempSpan.setCssProps({
+            'visibility': 'hidden',
+            'position': 'absolute',
+            'white-space': 'nowrap',
+        });
         
         const computedStyle = window.getComputedStyle(select);
-        tempSpan.style.fontSize = computedStyle.fontSize;
-        tempSpan.style.fontFamily = computedStyle.fontFamily;
+        tempSpan.setCssProps({
+            'font-size': computedStyle.fontSize,
+            'font-family': computedStyle.fontFamily,
+        });
         
         tempSpan.innerText = select.options[select.selectedIndex].text;
         document.body.appendChild(tempSpan);
@@ -281,12 +282,12 @@ export class KeepView extends ItemView {
             this.gridContainer.empty();
 
             if (pinnedFiles.length > 0) {
-                this.gridContainer.createEl('h3', { text: 'PINNED', cls: 'keep-section-title' });
+                this.gridContainer.createEl('h3', { text: 'Pinned', cls: 'keep-section-title' });
                 const pinnedGrid = this.gridContainer.createEl('div', { cls: 'keep-grid' });
                 await this.renderCards(pinnedFiles, pinnedGrid);
                 
                 if (unpinnedFiles.length > 0) {
-                    this.gridContainer.createEl('h3', { text: 'OTHERS', cls: 'keep-section-title keep-section-title-others' });
+                    this.gridContainer.createEl('h3', { text: 'Others', cls: 'keep-section-title keep-section-title-others' });
                 }
             }
 
@@ -330,7 +331,7 @@ export class KeepView extends ItemView {
                     return this.app.vault.getResourcePath(linkedFile);
                 }
                 return null;
-            }).filter(img => img !== null) as string[];
+            }).filter((img): img is string => img !== null);
 
             const snippetText = contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, '').trim();
             const snippet = snippetText.substring(0, 250) + (snippetText.length > 250 ? '...' : '');
@@ -362,9 +363,9 @@ export class KeepView extends ItemView {
                 }
             }
           
-            pinBtn.addEventListener('click', async (e) => {
+            pinBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                await this.app.fileManager.processFrontMatter(file, (fm) => {
+                void this.app.fileManager.processFrontMatter(file, (fm) => {
                     fm.pinned = !isPinned;
                 });
             });
@@ -380,10 +381,11 @@ export class KeepView extends ItemView {
                 deleteSvg.setAttribute('stroke', 'currentColor');
             }
             
-            deleteBtn.addEventListener('click', async (e) => {
+            deleteBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                await this.app.vault.trash(file, true);
-                this.requestRender();
+                void this.app.fileManager.trashFile(file).then(() => {
+                    this.requestRender();
+                });
             });
           
           
@@ -404,14 +406,13 @@ export class KeepView extends ItemView {
 }
 
 export default class KeepPlugin extends Plugin {
-    async onload() {
+    onload() {
         this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
-        this.addRibbonIcon('layout-grid', 'Open Note Masonry', () => this.activateView());
+        this.addRibbonIcon('layout-grid', 'Open Note Masonry', () => void this.activateView());
     }
 
     async activateView() {
         const { workspace } = this.app;
-        // Always open a new tab to allow multiple Vault Notes pages
         const leaf = workspace.getLeaf('tab');
         await leaf.setViewState({ type: KEEP_VIEW_TYPE, active: true });
         workspace.revealLeaf(leaf);

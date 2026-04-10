@@ -43,8 +43,9 @@ var NoteEditModal = class extends import_obsidian.Modal {
   async onOpen() {
     this.contentEl.empty();
     this.modalEl.addClass("keep-editor-modal");
-    if (this.bgEl) {
-      this.bgEl.addClass("keep-modal-bg");
+    const modal = this;
+    if (modal.bgEl) {
+      modal.bgEl.addClass("keep-modal-bg");
     }
     this.contentEl.addClass("keep-editor-modal-content");
     let isNewFile = false;
@@ -133,8 +134,8 @@ var KeepView = class extends import_obsidian.ItemView {
     };
   }
   async setState(state, result) {
-    this.selectedFolder = state.selectedFolder || "";
-    this.selectedTag = state.selectedTag || "";
+    this.selectedFolder = typeof state.selectedFolder === "string" ? state.selectedFolder : "";
+    this.selectedTag = typeof state.selectedTag === "string" ? state.selectedTag : "";
     await super.setState(state, result);
     this.requestRender();
   }
@@ -169,14 +170,14 @@ var KeepView = class extends import_obsidian.ItemView {
     this.registerEvent(this.app.vault.on("delete", () => this.requestRender()));
     this.registerEvent(this.app.vault.on("rename", () => this.requestRender()));
     this.registerEvent(this.app.metadataCache.on("changed", () => this.requestRender()));
-    await this.renderGrid();
+    void this.renderGrid();
   }
   requestRender() {
     if (this.renderTimeout) {
       clearTimeout(this.renderTimeout);
     }
     this.renderTimeout = setTimeout(() => {
-      this.renderGrid();
+      void this.renderGrid();
     }, 300);
   }
   updateFilterUI() {
@@ -185,7 +186,7 @@ var KeepView = class extends import_obsidian.ItemView {
     if (this.folderSelect.options.length !== folders.length + 1) {
       const currentFolder = this.selectedFolder;
       this.folderSelect.empty();
-      this.folderSelect.createEl("option", { value: "", text: "All Folders" });
+      this.folderSelect.createEl("option", { value: "", text: "All folders" });
       folders.forEach((f) => {
         if (f.path === "/")
           return;
@@ -197,7 +198,7 @@ var KeepView = class extends import_obsidian.ItemView {
     if (this.tagSelect.options.length !== tags.length + 1) {
       const currentTag = this.selectedTag;
       this.tagSelect.empty();
-      this.tagSelect.createEl("option", { value: "", text: "All Tags" });
+      this.tagSelect.createEl("option", { value: "", text: "All tags" });
       tags.forEach((t) => {
         const option = this.tagSelect.createEl("option", { value: t, text: t });
         if (t === currentTag)
@@ -213,12 +214,16 @@ var KeepView = class extends import_obsidian.ItemView {
     if (!select || select.options.length === 0)
       return;
     const tempSpan = document.createElement("span");
-    tempSpan.style.visibility = "hidden";
-    tempSpan.style.position = "absolute";
-    tempSpan.style.whiteSpace = "nowrap";
+    tempSpan.setCssProps({
+      "visibility": "hidden",
+      "position": "absolute",
+      "white-space": "nowrap"
+    });
     const computedStyle = window.getComputedStyle(select);
-    tempSpan.style.fontSize = computedStyle.fontSize;
-    tempSpan.style.fontFamily = computedStyle.fontFamily;
+    tempSpan.setCssProps({
+      "font-size": computedStyle.fontSize,
+      "font-family": computedStyle.fontFamily
+    });
     tempSpan.innerText = select.options[select.selectedIndex].text;
     document.body.appendChild(tempSpan);
     const textWidth = tempSpan.getBoundingClientRect().width;
@@ -259,11 +264,11 @@ var KeepView = class extends import_obsidian.ItemView {
       }
       this.gridContainer.empty();
       if (pinnedFiles.length > 0) {
-        this.gridContainer.createEl("h3", { text: "PINNED", cls: "keep-section-title" });
+        this.gridContainer.createEl("h3", { text: "Pinned", cls: "keep-section-title" });
         const pinnedGrid = this.gridContainer.createEl("div", { cls: "keep-grid" });
         await this.renderCards(pinnedFiles, pinnedGrid);
         if (unpinnedFiles.length > 0) {
-          this.gridContainer.createEl("h3", { text: "OTHERS", cls: "keep-section-title keep-section-title-others" });
+          this.gridContainer.createEl("h3", { text: "Others", cls: "keep-section-title keep-section-title-others" });
         }
       }
       const unpinnedGrid = this.gridContainer.createEl("div", { cls: "keep-grid" });
@@ -326,9 +331,9 @@ var KeepView = class extends import_obsidian.ItemView {
           svg.setAttribute("fill", "currentColor");
         }
       }
-      pinBtn.addEventListener("click", async (e) => {
+      pinBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        await this.app.fileManager.processFrontMatter(file, (fm) => {
+        void this.app.fileManager.processFrontMatter(file, (fm) => {
           fm.pinned = !isPinned;
         });
       });
@@ -341,10 +346,11 @@ var KeepView = class extends import_obsidian.ItemView {
         deleteSvg.setAttribute("fill", "none");
         deleteSvg.setAttribute("stroke", "currentColor");
       }
-      deleteBtn.addEventListener("click", async (e) => {
+      deleteBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        await this.app.vault.trash(file, true);
-        this.requestRender();
+        void this.app.fileManager.trashFile(file).then(() => {
+          this.requestRender();
+        });
       });
       if (file.basename) {
         card.createEl("h3", { text: file.basename, cls: "keep-card-title" });
@@ -360,9 +366,9 @@ var KeepView = class extends import_obsidian.ItemView {
   }
 };
 var KeepPlugin = class extends import_obsidian.Plugin {
-  async onload() {
+  onload() {
     this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
-    this.addRibbonIcon("layout-grid", "Open Note Masonry", () => this.activateView());
+    this.addRibbonIcon("layout-grid", "Open Note Masonry", () => void this.activateView());
   }
   async activateView() {
     const { workspace } = this.app;
