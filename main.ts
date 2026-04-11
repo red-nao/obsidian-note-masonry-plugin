@@ -116,7 +116,7 @@ export class KeepView extends ItemView {
     }
 
     getDisplayText() {
-        return "Note Masonry";
+        return "Note masonry";
     }
 
     getIcon() {
@@ -177,7 +177,7 @@ export class KeepView extends ItemView {
         this.registerEvent(this.app.vault.on('rename', () => this.requestRender()));
         this.registerEvent(this.app.metadataCache.on('changed', () => this.requestRender()));
 
-        void this.renderGrid();
+        await this.renderGrid();
     }
 
     requestRender() {
@@ -190,7 +190,7 @@ export class KeepView extends ItemView {
     }
 
     updateFilterUI() {
-        const folders = this.app.vault.getAllLoadedFiles().filter(f => f instanceof TFolder) as TFolder[];
+        const folders = this.app.vault.getAllLoadedFiles().filter((f): f is TFolder => f instanceof TFolder);
         // @ts-ignore
         const tags = Object.keys(this.app.metadataCache.getTags());
 
@@ -408,13 +408,13 @@ export class KeepView extends ItemView {
 export default class KeepPlugin extends Plugin {
     onload() {
         this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
-        this.addRibbonIcon('layout-grid', 'Open Note Masonry', () => void this.activateView());
+        this.addRibbonIcon('layout-grid', 'Open note masonry', () => void this.activateView());
     }
 
     async activateView() {
         const { workspace } = this.app;
         const leaf = workspace.getLeaf('tab');
         await leaf.setViewState({ type: KEEP_VIEW_TYPE, active: true });
-        workspace.revealLeaf(leaf);
+        await workspace.revealLeaf(leaf);
     }
 }

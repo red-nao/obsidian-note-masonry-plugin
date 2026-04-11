@@ -121,7 +121,7 @@ var KeepView = class extends import_obsidian.ItemView {
     return KEEP_VIEW_TYPE;
   }
   getDisplayText() {
-    return "Note Masonry";
+    return "Note masonry";
   }
   getIcon() {
     return "layout-grid";
@@ -170,7 +170,7 @@ var KeepView = class extends import_obsidian.ItemView {
     this.registerEvent(this.app.vault.on("delete", () => this.requestRender()));
     this.registerEvent(this.app.vault.on("rename", () => this.requestRender()));
     this.registerEvent(this.app.metadataCache.on("changed", () => this.requestRender()));
-    void this.renderGrid();
+    await this.renderGrid();
   }
   requestRender() {
     if (this.renderTimeout) {
@@ -368,12 +368,12 @@ var KeepView = class extends import_obsidian.ItemView {
 var KeepPlugin = class extends import_obsidian.Plugin {
   onload() {
     this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
-    this.addRibbonIcon("layout-grid", "Open Note Masonry", () => void this.activateView());
+    this.addRibbonIcon("layout-grid", "Open note masonry", () => void this.activateView());
   }
   async activateView() {
     const { workspace } = this.app;
     const leaf = workspace.getLeaf("tab");
     await leaf.setViewState({ type: KEEP_VIEW_TYPE, active: true });
-    workspace.revealLeaf(leaf);
+    await workspace.revealLeaf(leaf);
   }
 };
