@@ -52,28 +52,107 @@
     color: var(--text-muted);
 }
 
-.keep-create-button {
+.keep-search-container {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-width: 0;
+}
+
+.keep-search-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 150px;
+  transition: width 0.3s ease;
+}
+
+.keep-search-wrapper:hover,
+.keep-search-wrapper.is-focused,
+.keep-search-wrapper.has-value {
+  width: min(400px, 60vw);
+}
+
+.keep-search-icon {
+  position: absolute;
+  left: 8px;
+  margin-right: 8px;
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.keep-search-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.keep-search-input {
+  width: 100%;
+  padding: 6px 12px 6px 32px !important;
+  border: none !important;
+  border-radius: 20px;
+  background: var(--background-modifier-form-field);
+  font-size: 14px;
+  transition: all 0.3s ease;
+  color: transparent;
+  cursor: pointer;
+}
+
+.keep-search-wrapper:hover .keep-search-input,
+.keep-search-wrapper.is-focused .keep-search-input,
+.keep-search-wrapper.has-value .keep-search-input {
+  color: var(--text-normal);
+  border-color: var(--background-modifier-border);
+  cursor: text;
+}
+
+.keep-search-input:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+  background: var(--background-primary);
+}
+
+.keep-search-input::placeholder {
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.keep-search-wrapper:hover .keep-search-input::placeholder,
+.keep-search-wrapper.is-focused .keep-search-input::placeholder,
+.keep-search-wrapper.has-value .keep-search-input::placeholder {
+  opacity: 1;
+}
+
+.keep-filter-container .keep-create-button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 30px;
     height: 30px;
     padding: 0;
+    box-shadow: none;
     border-radius: 999px;
     border: none;
     background-color: transparent;
-    color: var(--text-normal);
+    color: var(--color-base-40);
     cursor: pointer;
     transition: background-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease;
 }
 
 .keep-create-button:hover {
     background-color: var(--background-modifier-hover);
+    color: var(--text-normal);
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
 }
 
 .keep-create-button:active {
     transform: translateY(1px);
+    color: var(--text-normal);
     box-shadow: none;
 }
 

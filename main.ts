@@ -100,11 +100,13 @@ export class KeepView extends ItemView {
     gridContainer: HTMLElement;
     folderSelect: HTMLSelectElement;
     tagSelect: HTMLSelectElement;
+    searchInput: HTMLInputElement;
     private isRendering = false;
     private renderTimeout: NodeJS.Timeout | null = null;
     
     selectedFolder: string = '';
     selectedTag: string = '';
+    searchQuery: string = '';
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -126,13 +128,15 @@ export class KeepView extends ItemView {
         return {
             ...super.getState(),
             selectedFolder: this.selectedFolder,
-            selectedTag: this.selectedTag
+            selectedTag: this.selectedTag,
+            searchQuery: this.searchQuery
         };
     }
 
     async setState(state: Record<string, unknown>, result: Parameters<ItemView['setState']>[1]) {
         this.selectedFolder = typeof state.selectedFolder === 'string' ? state.selectedFolder : '';
         this.selectedTag = typeof state.selectedTag === 'string' ? state.selectedTag : '';
+        this.searchQuery = typeof state.searchQuery === 'string' ? state.searchQuery : '';
         await super.setState(state, result);
         this.requestRender();
     }
@@ -159,6 +163,40 @@ export class KeepView extends ItemView {
             this.adjustSelectWidth(this.tagSelect);   
             this.requestRender();
         });
+
+        const searchContainer = filterContainer.createEl('div', { cls: 'keep-search-container' });
+    
+        const searchWrapper = searchContainer.createEl('div', { cls: 'keep-search-wrapper' });
+        
+        const searchIconWrapper = searchWrapper.createEl('div', { cls: 'keep-search-icon' });
+        setIcon(searchIconWrapper, 'search');
+        
+        this.searchInput = searchWrapper.createEl('input', {
+            cls: 'keep-search-input',
+            attr: {
+                type: 'text',
+                placeholder: 'Search notes...'
+            }
+        });
+        
+        this.searchInput.value = this.searchQuery;
+        
+        this.searchInput.addEventListener('input', (e) => {
+            this.searchQuery = (e.target as HTMLInputElement).value;
+            this.updateSearchVisibility();
+            this.requestRender();
+        });
+    
+        this.searchInput.addEventListener('focus', () => {
+            searchWrapper.addClass('is-focused');
+        });
+    
+        this.searchInput.addEventListener('blur', () => {
+            searchWrapper.removeClass('is-focused');
+        });
+    
+        // 初期表示状態を設定
+        this.updateSearchVisibility();
     
         const createButton = filterContainer.createEl('button', {
             cls: 'keep-create-button',
@@ -179,6 +217,17 @@ export class KeepView extends ItemView {
         await this.renderGrid();
     }
 
+    updateSearchVisibility() {
+      const searchWrapper = this.containerEl.querySelector('.keep-search-wrapper') as HTMLElement;
+      if (searchWrapper) {
+          if (this.searchQuery) {
+              searchWrapper.addClass('has-value');
+          } else {
+              searchWrapper.removeClass('has-value');
+          }
+      }
+    }
+    
     requestRender() {
         if (this.renderTimeout) {
             clearTimeout(this.renderTimeout);
@@ -258,12 +307,37 @@ export class KeepView extends ItemView {
             if (this.selectedFolder) {
                 files = files.filter(f => f.parent?.path === this.selectedFolder || f.parent?.path.startsWith(this.selectedFolder + '/'));
             }
+            
             if (this.selectedTag) {
                 files = files.filter(f => {
                     const cache = this.app.metadataCache.getFileCache(f);
                     const tags = cache ? getAllTags(cache) || [] : [];
                     return tags.includes(this.selectedTag);
                 });
+            }
+
+            if (this.searchQuery) {
+                const query = this.searchQuery.toLowerCase();
+                const searchPromises = files.map(async (f) => {
+                    const content = await this.app.vault.cachedRead(f);
+                    const cache = this.app.metadataCache.getFileCache(f);
+                    
+                    if (f.basename.toLowerCase().includes(query)) {
+                        return true;
+                    }
+                    
+                    let contentWithoutFrontmatter = content;
+                    if (cache?.frontmatterPosition) {
+                        contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
+                    } else {
+                        contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+                    }
+                    
+                    return contentWithoutFrontmatter.toLowerCase().includes(query);
+                });
+                
+                const searchResults = await Promise.all(searchPromises);
+                files = files.filter((_, index) => searchResults[index]);
             }
 
             files.sort((a, b) => b.stat.mtime - a.stat.mtime);

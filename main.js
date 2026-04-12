@@ -116,6 +116,7 @@ var KeepView = class extends import_obsidian.ItemView {
     this.renderTimeout = null;
     this.selectedFolder = "";
     this.selectedTag = "";
+    this.searchQuery = "";
   }
   getViewType() {
     return KEEP_VIEW_TYPE;
@@ -130,12 +131,14 @@ var KeepView = class extends import_obsidian.ItemView {
     return {
       ...super.getState(),
       selectedFolder: this.selectedFolder,
-      selectedTag: this.selectedTag
+      selectedTag: this.selectedTag,
+      searchQuery: this.searchQuery
     };
   }
   async setState(state, result) {
     this.selectedFolder = typeof state.selectedFolder === "string" ? state.selectedFolder : "";
     this.selectedTag = typeof state.selectedTag === "string" ? state.selectedTag : "";
+    this.searchQuery = typeof state.searchQuery === "string" ? state.searchQuery : "";
     await super.setState(state, result);
     this.requestRender();
   }
@@ -157,6 +160,30 @@ var KeepView = class extends import_obsidian.ItemView {
       this.adjustSelectWidth(this.tagSelect);
       this.requestRender();
     });
+    const searchContainer = filterContainer.createEl("div", { cls: "keep-search-container" });
+    const searchWrapper = searchContainer.createEl("div", { cls: "keep-search-wrapper" });
+    const searchIconWrapper = searchWrapper.createEl("div", { cls: "keep-search-icon" });
+    (0, import_obsidian.setIcon)(searchIconWrapper, "search");
+    this.searchInput = searchWrapper.createEl("input", {
+      cls: "keep-search-input",
+      attr: {
+        type: "text",
+        placeholder: "Search notes..."
+      }
+    });
+    this.searchInput.value = this.searchQuery;
+    this.searchInput.addEventListener("input", (e) => {
+      this.searchQuery = e.target.value;
+      this.updateSearchVisibility();
+      this.requestRender();
+    });
+    this.searchInput.addEventListener("focus", () => {
+      searchWrapper.addClass("is-focused");
+    });
+    this.searchInput.addEventListener("blur", () => {
+      searchWrapper.removeClass("is-focused");
+    });
+    this.updateSearchVisibility();
     const createButton = filterContainer.createEl("button", {
       cls: "keep-create-button"
     });
@@ -171,6 +198,16 @@ var KeepView = class extends import_obsidian.ItemView {
     this.registerEvent(this.app.vault.on("rename", () => this.requestRender()));
     this.registerEvent(this.app.metadataCache.on("changed", () => this.requestRender()));
     await this.renderGrid();
+  }
+  updateSearchVisibility() {
+    const searchWrapper = this.containerEl.querySelector(".keep-search-wrapper");
+    if (searchWrapper) {
+      if (this.searchQuery) {
+        searchWrapper.addClass("has-value");
+      } else {
+        searchWrapper.removeClass("has-value");
+      }
+    }
   }
   requestRender() {
     if (this.renderTimeout) {
@@ -250,6 +287,25 @@ var KeepView = class extends import_obsidian.ItemView {
           const tags = cache ? (0, import_obsidian.getAllTags)(cache) || [] : [];
           return tags.includes(this.selectedTag);
         });
+      }
+      if (this.searchQuery) {
+        const query = this.searchQuery.toLowerCase();
+        const searchPromises = files.map(async (f) => {
+          const content = await this.app.vault.cachedRead(f);
+          const cache = this.app.metadataCache.getFileCache(f);
+          if (f.basename.toLowerCase().includes(query)) {
+            return true;
+          }
+          let contentWithoutFrontmatter = content;
+          if (cache == null ? void 0 : cache.frontmatterPosition) {
+            contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
+          } else {
+            contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+          }
+          return contentWithoutFrontmatter.toLowerCase().includes(query);
+        });
+        const searchResults = await Promise.all(searchPromises);
+        files = files.filter((_, index) => searchResults[index]);
       }
       files.sort((a, b) => b.stat.mtime - a.stat.mtime);
       const pinnedFiles = [];
