@@ -71,7 +71,8 @@
 .keep-search-wrapper:hover,
 .keep-search-wrapper.is-focused,
 .keep-search-wrapper.has-value {
-  width: min(400px, 60vw);
+  width: min(250px, 60vw);
+  margin-right: 70px;
 }
 
 .keep-search-icon {
