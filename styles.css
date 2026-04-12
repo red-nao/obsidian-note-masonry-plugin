@@ -29,7 +29,7 @@
 }
 
 .keep-filter-container .keep-select {
-    padding: 6px 6px;
+    padding: 6px 6px 6px 12px;
     border-radius: 6px;
     border: none;
     background-color: transparent;
@@ -101,6 +101,7 @@
     break-inside: avoid;
     margin-bottom: 16px;
     padding: 16px;
+    padding-bottom: 32px;
     border: 1px solid var(--background-modifier-border);
     border-radius: 8px;
     background-color: var(--background-primary-alt);
@@ -150,10 +151,10 @@
     opacity: 1;
 }
 
-.keep-card .keep-delete-btn {
+.keep-card .keep-delete-btn,
+.keep-card .keep-split-btn {
     position: absolute;
-    right: 8px;
-    bottom: 8px;
+    bottom: 6px;
     background: transparent;
     border: none;
     outline: none;
@@ -172,18 +173,30 @@
         background-color 0.2s ease;
 }
 
+.keep-card .keep-delete-btn {
+    right: 8px;
+}
+
+.keep-card .keep-split-btn {
+    right: 38px;
+}
+
 .keep-card .keep-delete-btn:focus-visible,
-.keep-card .keep-delete-btn:focus {
+.keep-card .keep-delete-btn:focus,
+.keep-card .keep-split-btn:focus-visible,
+.keep-card .keep-split-btn:focus {
     outline: none;
     box-shadow: none;
 }
 
-.keep-card .keep-delete-btn:hover {
+.keep-card .keep-delete-btn:hover,
+.keep-card .keep-split-btn:hover {
     background-color: var(--background-modifier-hover);
     color: var(--text-normal);
 }
 
-.keep-card:hover .keep-delete-btn {
+.keep-card:hover .keep-delete-btn,
+.keep-card:hover .keep-split-btn {
     opacity: 1;
 }
 

@@ -337,6 +337,21 @@ var KeepView = class extends import_obsidian.ItemView {
           fm.pinned = !isPinned;
         });
       });
+      const splitBtn = card.createEl("button", {
+        cls: "keep-split-btn",
+        attr: { "aria-label": "Open in split view" }
+      });
+      (0, import_obsidian.setIcon)(splitBtn, "panel-right");
+      const splitSvg = splitBtn.querySelector("svg");
+      if (splitSvg) {
+        splitSvg.setAttribute("fill", "none");
+        splitSvg.setAttribute("stroke", "currentColor");
+      }
+      splitBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const leaf = this.app.workspace.getLeaf("split");
+        void leaf.openFile(file);
+      });
       const deleteBtn = card.createEl("button", {
         cls: "keep-delete-btn"
       });
