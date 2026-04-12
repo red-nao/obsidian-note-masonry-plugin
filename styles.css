@@ -197,6 +197,40 @@
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 }
 
+.keep-card .keep-split-btn {
+    position: absolute;
+    top: 8px;
+    right: 38px;
+    background: transparent;
+    border: none;
+    outline: none;
+    box-shadow: none;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s ease, color 0.2s ease, background-color 0.2s ease;
+    color: var(--color-base-40);
+    padding: 5px 6px 6px 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+}
+
+.keep-card .keep-split-btn:focus-visible,
+.keep-card .keep-split-btn:focus {
+    outline: none;
+    box-shadow: none;
+}
+
+.keep-card .keep-split-btn:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.keep-card:hover .keep-split-btn {
+    opacity: 1;
+}
+
 .keep-card .keep-pin-btn {
     position: absolute;
     top: 8px;
@@ -231,10 +265,10 @@
     opacity: 1;
 }
 
-.keep-card .keep-delete-btn,
-.keep-card .keep-split-btn {
+.keep-card .keep-delete-btn {
     position: absolute;
     bottom: 6px;
+    right: 8px;
     background: transparent;
     border: none;
     outline: none;
@@ -253,30 +287,18 @@
         background-color 0.2s ease;
 }
 
-.keep-card .keep-delete-btn {
-    right: 8px;
-}
-
-.keep-card .keep-split-btn {
-    right: 38px;
-}
-
 .keep-card .keep-delete-btn:focus-visible,
-.keep-card .keep-delete-btn:focus,
-.keep-card .keep-split-btn:focus-visible,
-.keep-card .keep-split-btn:focus {
+.keep-card .keep-delete-btn:focus {
     outline: none;
     box-shadow: none;
 }
 
-.keep-card .keep-delete-btn:hover,
-.keep-card .keep-split-btn:hover {
+.keep-card .keep-delete-btn:hover {
     background-color: var(--background-modifier-hover);
     color: var(--text-normal);
 }
 
-.keep-card:hover .keep-delete-btn,
-.keep-card:hover .keep-split-btn {
+.keep-card:hover .keep-delete-btn {
     opacity: 1;
 }
 

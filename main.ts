@@ -418,6 +418,24 @@ export class KeepView extends ItemView {
                 });
             }
             
+            const splitBtn = card.createEl('button', {
+              cls: 'keep-split-btn',
+              attr: { 'aria-label': 'Open in split view' }
+            });
+            setIcon(splitBtn, 'panel-right');
+            
+            const splitSvg = splitBtn.querySelector('svg');
+            if (splitSvg) {
+                splitSvg.setAttribute('fill', 'none');
+                splitSvg.setAttribute('stroke', 'currentColor');
+            }
+            
+            splitBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const leaf = this.app.workspace.getLeaf('split');
+                void leaf.openFile(file);
+            });
+
             const pinBtn = card.createEl('button', { cls: 'keep-pin-btn' });
             setIcon(pinBtn, 'pin');
           
@@ -441,24 +459,6 @@ export class KeepView extends ItemView {
                 void this.app.fileManager.processFrontMatter(file, (fm) => {
                     fm.pinned = !isPinned;
                 });
-            });
-
-            const splitBtn = card.createEl('button', {
-              cls: 'keep-split-btn',
-              attr: { 'aria-label': 'Open in split view' }
-            });
-            setIcon(splitBtn, 'panel-right');
-            
-            const splitSvg = splitBtn.querySelector('svg');
-            if (splitSvg) {
-                splitSvg.setAttribute('fill', 'none');
-                splitSvg.setAttribute('stroke', 'currentColor');
-            }
-            
-            splitBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const leaf = this.app.workspace.getLeaf('split');
-                void leaf.openFile(file);
             });
 
             const deleteBtn = card.createEl('button', {
