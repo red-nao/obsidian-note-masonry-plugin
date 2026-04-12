@@ -7,6 +7,7 @@ Note Masonry is an Obsidian plugin that shows your notes in a **Google Keep–st
 ## Features
 - Card-based, masonry-style grid of all your Markdown notes
 - Filter by folder and tag from a toolbar at the top
+- Search bar to filter notes by title or content instantly
 - Pinned section for notes with `pinned: true` in frontmatter
 - Up to 2 image thumbnails per note (Markdown images or wikilinks)
 - Text snippet preview with frontmatter and image markup removed
@@ -26,7 +27,8 @@ Note Masonry is an Obsidian plugin that shows your notes in a **Google Keep–st
 ## Usage
 - Use the **grid icon** in the left ribbon to open Keep View.
 - You can click the ribbon button multiple times to open multiple Keep View tabs/pages.
-- Use the folder and tag dropdowns to filter notes.
+- Use the folder and tag dropdowns to filter notes
+- Use the **search bar** at the top to filter notes by text in the title or body.
 - Click the **“+” button** to create a new note in a modal editor.
 - Click a card to open it in the modal.
 - Use the **pin icon** to toggle `pinned: true` in frontmatter.
