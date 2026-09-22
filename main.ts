@@ -1,4 +1,4 @@
-import { App, ItemView, MarkdownFileInfo, Plugin, Scope, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
+import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Notice, Plugin, Scope, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
 
 export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
@@ -652,11 +652,42 @@ export class KeepView extends ItemView {
             const snippet = snippetText.substring(0, 250) + (snippetText.length > 250 ? '...' : '');
 
             const card = fragment.createEl('div', { cls: 'keep-card' });
+            card.draggable = true;
+            let cardWasDragged = false;
+            card.addEventListener('dragstart', (e: DragEvent) => {
+                cardWasDragged = true;
+                card.addClass('is-dragging');
+                try {
+                    const dm = (this.app as unknown as { dragManager?: {
+                        dragFile?: (evt: DragEvent, file: TFile) => unknown;
+                        onDragStart?: (evt: DragEvent, info: unknown) => void;
+                    } }).dragManager;
+                    if (dm?.dragFile && dm?.onDragStart) {
+                        // dragFile()はdataTransferにobsidian://URLを積んだ上で内部用ドラッグ情報を返す。
+                        // それをonDragStart()に渡さないとCanvasのhandleDrop受け口が
+                        // 内部fileドロップとして認識できず、URLのリンクカードになってしまう。
+                        const info = dm.dragFile(e, file);
+                        if (info) dm.onDragStart(e, info);
+                    } else if (dm?.dragFile) {
+                        dm.dragFile(e, file);
+                    } else if (e.dataTransfer) {
+                        e.dataTransfer.effectAllowed = 'copy';
+                        try { e.dataTransfer.setData('text/plain', file.path); } catch { /* ignore */ }
+                    }
+                } catch {
+                    // 非公開APIが無い/変わってもDnD以外は壊さない
+                }
+            });
+            card.addEventListener('dragend', () => {
+                card.removeClass('is-dragging');
+                window.setTimeout(() => { cardWasDragged = false; }, 150);
+            });
             
             if (resolvedImages.length > 0) {
                 const imgContainer = card.createEl('div', { cls: `keep-card-images keep-card-images-${resolvedImages.length}` });
                 resolvedImages.forEach(img => {
-                    imgContainer.createEl('img', { attr: { src: img } });
+                    const imgEl = imgContainer.createEl('img', { attr: { src: img } });
+                    imgEl.draggable = false;
                 });
             }
             
@@ -703,22 +734,48 @@ export class KeepView extends ItemView {
                 });
             });
 
-            const deleteBtn = card.createEl('button', {
-                cls: 'keep-delete-btn',
+            const menuBtn = card.createEl('button', {
+                cls: 'keep-menu-btn',
+                attr: { 'aria-label': 'Card menu' }
             });
-            setIcon(deleteBtn, 'trash');
+            setIcon(menuBtn, 'more-horizontal');
             
-            const deleteSvg = deleteBtn.querySelector('svg');
-            if (deleteSvg) {
-                deleteSvg.setAttribute('fill', 'none');
-                deleteSvg.setAttribute('stroke', 'currentColor');
+            const menuSvg = menuBtn.querySelector('svg');
+            if (menuSvg) {
+                menuSvg.setAttribute('fill', 'none');
+                menuSvg.setAttribute('stroke', 'currentColor');
             }
             
-            deleteBtn.addEventListener('click', (e) => {
+            menuBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                void this.app.fileManager.trashFile(file).then(() => {
-                    this.requestRender();
+                const menu = new Menu();
+                menu.addItem((item) => {
+                    item.setTitle('Delete')
+                        .setIcon('trash')
+                        .onClick(() => {
+                            void this.app.fileManager.trashFile(file).then(() => {
+                                this.requestRender();
+                            });
+                        });
                 });
+                menu.showAtMouseEvent(e);
+            });
+
+            const canvasBtn = card.createEl('button', {
+                cls: 'keep-canvas-btn',
+                attr: { 'aria-label': 'Send to Canvas' }
+            });
+            setIcon(canvasBtn, 'layout-dashboard');
+            
+            const canvasSvg = canvasBtn.querySelector('svg');
+            if (canvasSvg) {
+                canvasSvg.setAttribute('fill', 'none');
+                canvasSvg.setAttribute('stroke', 'currentColor');
+            }
+            
+            canvasBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                void this.sendFileToCanvas(file);
             });
           
           
@@ -731,10 +788,235 @@ export class KeepView extends ItemView {
             }
 
             card.addEventListener('click', () => {
+                if (cardWasDragged) {
+                    cardWasDragged = false;
+                    return;
+                }
                 new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+            });
+
+            card.addEventListener('contextmenu', (e: MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const menu = new Menu();
+                menu.addItem((item) => {
+                    item.setTitle('Send to Canvas')
+                        .setIcon('layout-dashboard')
+                        .onClick(() => void this.sendFileToCanvas(file));
+                });
+                menu.addItem((item) => {
+                    item.setTitle('Send to new Canvas')
+                        .setIcon('plus')
+                        .onClick(() => void this.createCanvasAndAdd(file));
+                });
+                menu.addSeparator();
+                menu.addItem((item) => {
+                    item.setTitle('Delete')
+                        .setIcon('trash')
+                        .onClick(() => {
+                            void this.app.fileManager.trashFile(file).then(() => {
+                                this.requestRender();
+                            });
+                        });
+                });
+                menu.showAtMouseEvent(e);
             });
         }
         container.appendChild(fragment);
+    }
+
+    getCanvasFiles(): TFile[] {
+        return this.app.vault.getFiles().filter((f) => f.extension === 'canvas');
+    }
+
+    private generateCanvasNodeId(): string {
+        try {
+            const buf = new Uint8Array(8);
+            crypto.getRandomValues(buf);
+            return Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+        } catch {
+            return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+        }
+    }
+
+    private getCanvasNodeXY(node: Record<string, unknown>): { x: number; y: number; w: number; h: number } {
+        const pos = (node.position as { x?: unknown; y?: unknown } | undefined) ?? undefined;
+        const x = typeof node.x === 'number' ? node.x : (typeof pos?.x === 'number' ? pos.x : 0);
+        const y = typeof node.y === 'number' ? node.y : (typeof pos?.y === 'number' ? pos.y : 0);
+        const w = typeof node.width === 'number' ? node.width : 400;
+        const h = typeof node.height === 'number' ? node.height : 300;
+        return { x, y, w, h };
+    }
+
+    private calcCanvasNewPosition(nodes: Record<string, unknown>[]): { x: number; y: number } {
+        if (!nodes || nodes.length === 0) return { x: 0, y: 0 };
+        let maxRight = Number.NEGATIVE_INFINITY;
+        let yForNew = 0;
+        let hasValid = false;
+        for (const n of nodes) {
+            const { x, y, w } = this.getCanvasNodeXY(n);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+            hasValid = true;
+            const right = x + (Number.isFinite(w) ? w : 400);
+            if (right > maxRight) {
+                maxRight = right;
+                yForNew = y;
+            }
+        }
+        if (!hasValid) return { x: 0, y: 0 };
+        // 右端にカスケード配置。50pxずらしで重なり回避しつつ、縦にも少しずらす
+        const offset = (nodes.length % 8) * 40;
+        return { x: maxRight + 50, y: yForNew + offset };
+    }
+
+    private getActiveCanvasFile(): TFile | null {
+        try {
+            const activeLeaf = this.app.workspace.activeLeaf;
+            if (!activeLeaf) return null;
+            const canvasLeaves = this.app.workspace.getLeavesOfType('canvas');
+            if (!canvasLeaves.includes(activeLeaf)) return null;
+            const f = (activeLeaf.view as unknown as { file?: TFile }).file;
+            if (f instanceof TFile && f.extension === 'canvas') return f;
+        } catch {
+            // ignore
+        }
+        return null;
+    }
+
+    private pickCanvasFile(files: TFile[]): Promise<TFile | null> {
+        return new Promise((resolve) => {
+            const modal = new CanvasPickerModal(this.app, files, (f) => resolve(f));
+            modal.open();
+        });
+    }
+
+    async sendFileToCanvas(file: TFile): Promise<void> {
+        try {
+            const canvasFiles = this.getCanvasFiles();
+            if (canvasFiles.length === 0) {
+                await this.createCanvasAndAdd(file);
+                return;
+            }
+            const active = this.getActiveCanvasFile();
+            if (active && canvasFiles.some((f) => f.path === active.path)) {
+                await this.addFileToCanvas(active, file);
+                return;
+            }
+            if (canvasFiles.length === 1) {
+                await this.addFileToCanvas(canvasFiles[0], file);
+                return;
+            }
+            const picked = await this.pickCanvasFile(canvasFiles);
+            if (!picked) return;
+            await this.addFileToCanvas(picked, file);
+        } catch (e) {
+            console.error('Send to Canvas failed', e);
+            new Notice('Canvasへの送信に失敗しました');
+        }
+    }
+
+    async createCanvasAndAdd(file: TFile): Promise<void> {
+        const baseName = 'Untitled Canvas';
+        const folder = this.selectedFolder ? `${this.selectedFolder}/` : '';
+        let path = `${folder}${baseName}.canvas`;
+        let counter = 1;
+        while (this.app.vault.getAbstractFileByPath(path)) {
+            path = `${folder}${baseName} ${counter}.canvas`;
+            counter++;
+        }
+        const canvasFile = await this.app.vault.create(path, JSON.stringify({ nodes: [], edges: [] }, null, 2));
+        await this.addFileToCanvas(canvasFile, file);
+    }
+
+    /** 送信先Canvasを開いていればそのタブをアクティブ化し、無ければ新規タブで開く */
+    private async revealCanvasFile(canvasFile: TFile): Promise<void> {
+        try {
+            const leaves = this.app.workspace.getLeavesOfType('canvas');
+            for (const leaf of leaves) {
+                try {
+                    const f = (leaf.view as unknown as { file?: TFile }).file;
+                    if (f?.path === canvasFile.path) {
+                        await this.app.workspace.revealLeaf(leaf);
+                        return;
+                    }
+                } catch {
+                    // 次のleafを試す
+                }
+            }
+            const leaf = this.app.workspace.getLeaf('tab');
+            await leaf.openFile(canvasFile);
+        } catch {
+            // 表示に失敗してもノード追記自体は成功しているので無視
+        }
+    }
+
+    async addFileToCanvas(canvasFile: TFile, file: TFile): Promise<void> {
+        let raw = '';
+        try {
+            raw = await this.app.vault.read(canvasFile);
+        } catch {
+            raw = '';
+        }
+        let data: { nodes: Record<string, unknown>[]; edges: unknown[]; [k: string]: unknown };
+        try {
+            data = raw && raw.trim().length >= 2 ? JSON.parse(raw) as typeof data : { nodes: [], edges: [] };
+        } catch {
+            data = { nodes: [], edges: [] };
+        }
+        if (!Array.isArray(data.nodes)) data.nodes = [];
+        if (!Array.isArray(data.edges)) data.edges = [];
+
+        const { x, y } = this.calcCanvasNewPosition(data.nodes);
+        data.nodes.push({
+            id: this.generateCanvasNodeId(),
+            type: 'file',
+            file: file.path,
+            x,
+            y,
+            width: 400,
+            height: 300,
+        });
+
+        await this.app.vault.modify(canvasFile, JSON.stringify(data, null, 2));
+        new Notice(`Sent ${file.basename} → ${canvasFile.basename}`);
+        await this.revealCanvasFile(canvasFile);
+    }
+}
+
+class CanvasPickerModal extends FuzzySuggestModal<TFile> {
+    private files: TFile[];
+    private onPick: (f: TFile | null) => void;
+    private picked = false;
+
+    constructor(app: App, files: TFile[], onPick: (f: TFile | null) => void) {
+        super(app);
+        this.files = files;
+        this.onPick = onPick;
+        this.setPlaceholder('Send to Canvas: select target canvas');
+    }
+
+    getItems(): TFile[] {
+        return this.files;
+    }
+
+    getItemText(file: TFile): string {
+        return file.path;
+    }
+
+    onChooseItem(file: TFile): void {
+        this.picked = true;
+        this.onPick(file);
+    }
+
+    onClose(): void {
+        super.onClose();
+        // 注意: SuggestModal.selectSuggestion() は close() → onChooseItem() の順で呼ぶため、
+        // 選択時にも onClose が先に発火する。null解決を遅延させ、後続の選択を優先させる。
+        // (遅延なしだと選択が常にnull扱いになり、複数Canvas時に追加されない)
+        const self = this;
+        window.setTimeout(() => {
+            if (!self.picked) self.onPick(null);
+        }, 50);
     }
 }
 

@@ -265,6 +265,48 @@
     opacity: 1;
 }
 
+.keep-card .keep-canvas-btn {
+    position: absolute;
+    top: 8px;
+    right: 68px;
+    background: transparent;
+    border: none;
+    outline: none;
+    box-shadow: none;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s ease, color 0.2s ease, background-color 0.2s ease;
+    color: var(--color-base-40);
+    padding: 5px 6px 6px 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+}
+
+.keep-card .keep-canvas-btn:focus-visible,
+.keep-card .keep-canvas-btn:focus {
+    outline: none;
+    box-shadow: none;
+}
+
+.keep-card .keep-canvas-btn:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.keep-card:hover .keep-canvas-btn {
+    opacity: 1;
+}
+
+.keep-card.is-dragging {
+    opacity: 0.5;
+}
+
+.keep-card[draggable='true']:active {
+    cursor: grabbing;
+}
+
 .keep-card .keep-pin-btn {
     position: absolute;
     top: 8px;
@@ -299,7 +341,7 @@
     opacity: 1;
 }
 
-.keep-card .keep-delete-btn {
+.keep-card .keep-menu-btn {
     position: absolute;
     bottom: 6px;
     right: 8px;
@@ -321,18 +363,18 @@
         background-color 0.2s ease;
 }
 
-.keep-card .keep-delete-btn:focus-visible,
-.keep-card .keep-delete-btn:focus {
+.keep-card .keep-menu-btn:focus-visible,
+.keep-card .keep-menu-btn:focus {
     outline: none;
     box-shadow: none;
 }
 
-.keep-card .keep-delete-btn:hover {
+.keep-card .keep-menu-btn:hover {
     background-color: var(--background-modifier-hover);
     color: var(--text-normal);
 }
 
-.keep-card:hover .keep-delete-btn {
+.keep-card:hover .keep-menu-btn {
     opacity: 1;
 }
 
