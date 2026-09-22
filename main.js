@@ -39,11 +39,15 @@ var RENDER_YIELD_EVERY = 20;
 var DEFAULT_SCRATCH_FOLDER = "__masonry-scratch";
 var DEFAULT_SETTINGS = {
   canvasLabelSplitEnabled: true,
-  scratchFolder: DEFAULT_SCRATCH_FOLDER
+  scratchFolder: DEFAULT_SCRATCH_FOLDER,
+  newFileFolder: ""
 };
 function normalizeScratchFolder(raw) {
   const cleaned = (raw != null ? raw : "").replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
   return cleaned || DEFAULT_SCRATCH_FOLDER;
+}
+function normalizeNewFileFolder(raw) {
+  return (raw != null ? raw : "").replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
 }
 var NoteEditModal = class {
   constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "", hideTitle = false) {
@@ -184,10 +188,16 @@ var NoteEditModal = class {
     let isNewFile = false;
     if (!this.file) {
       const basePath = this.selectedFolder ? `${this.selectedFolder}/` : "";
+      if (this.selectedFolder) {
+        const existing = this.app.vault.getAbstractFileByPath(this.selectedFolder);
+        if (!existing) {
+          await this.app.vault.createFolder(this.selectedFolder);
+        }
+      }
       let newPath = `${basePath}Untitled.md`;
       let counter = 1;
       while (this.app.vault.getAbstractFileByPath(newPath)) {
-        newPath = `Untitled ${counter}.md`;
+        newPath = `${basePath}Untitled ${counter}.md`;
         counter++;
       }
       this.file = await this.app.vault.create(newPath, "");
@@ -280,6 +290,8 @@ var _KeepView = class extends import_obsidian.ItemView {
     this.canvasFocusCycle = {};
     /** テキスト編集用スクラッチの格納フォルダ（KeepPluginから注入される） */
     this.scratchFolder = DEFAULT_SCRATCH_FOLDER;
+    /** 新規作成ボタンの既定作成先フォルダ（KeepPluginから注入される・空欄はVault直下） */
+    this.newFileFolder = "";
     this.activeTextSession = null;
     /** ページネーション・キャッシュ用 */
     this.renderLimit = RENDER_INITIAL_LIMIT;
@@ -420,7 +432,7 @@ var _KeepView = class extends import_obsidian.ItemView {
     this.createButton = createButton;
     (0, import_obsidian.setIcon)(createButton, "plus");
     createButton.addEventListener("click", () => {
-      this.openNoteModal(null, { selectedFolder: this.selectedFolder, selectedTag: this.selectedTag });
+      this.openNoteModal(null, { selectedFolder: this.getEffectiveNewFileFolder(), selectedTag: this.selectedTag });
     });
     this.canvasBanner = container.createEl("div", { cls: "keep-canvas-banner" });
     this.canvasBanner.hide();
@@ -1169,6 +1181,16 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       this.normalizedScratchSource = this.scratchFolder;
     }
     return this.normalizedScratchCache;
+  }
+  /**
+   * 新規作成ボタンの実効的な作成先フォルダを返す。
+   * フォルダで絞り込み中はそのフォルダを優先し、未絞り込み(All folders)のときだけ
+   * 設定の既定フォルダを使う。空文字はVault直下を意味する。
+   */
+  getEffectiveNewFileFolder() {
+    if (this.selectedFolder)
+      return this.selectedFolder;
+    return normalizeNewFileFolder(this.newFileFolder);
   }
   isScratchFile(f) {
     if (f.name.endsWith(".masonry-scratch.md"))
@@ -1968,8 +1990,10 @@ var KeepPlugin = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
     this.registerView(KEEP_VIEW_TYPE, (leaf) => {
+      var _a;
       const view = new KeepView(leaf);
       view.scratchFolder = this.settings.scratchFolder;
+      view.newFileFolder = (_a = this.settings.newFileFolder) != null ? _a : "";
       return view;
     });
     this.addRibbonIcon("layout-grid", "Open note masonry", () => void this.activateView());
@@ -1985,18 +2009,22 @@ var KeepPlugin = class extends import_obsidian.Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
   async saveSettings() {
+    var _a;
     this.settings.scratchFolder = normalizeScratchFolder(this.settings.scratchFolder);
+    this.settings.newFileFolder = normalizeNewFileFolder((_a = this.settings.newFileFolder) != null ? _a : "");
     await this.saveData(this.settings);
     this.updateBodyClass();
-    this.syncScratchFolderToViews();
+    this.syncSettingsToViews();
   }
   /** 設定変更を既存の全KeepViewへ反映する */
-  syncScratchFolderToViews() {
+  syncSettingsToViews() {
+    var _a;
     try {
       for (const leaf of this.app.workspace.getLeavesOfType(KEEP_VIEW_TYPE)) {
         const view = leaf.view;
         if (view instanceof KeepView) {
           view.scratchFolder = this.settings.scratchFolder;
+          view.newFileFolder = (_a = this.settings.newFileFolder) != null ? _a : "";
         }
       }
     } catch (e) {
@@ -2175,11 +2203,18 @@ var NoteMasonrySettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Canvas\u30E9\u30D9\u30EB\u30AF\u30EA\u30C3\u30AF\u3067\u53F3\u306B\u958B\u304F").setDesc("Canvas\u306E\u30D5\u30A1\u30A4\u30EB\u540D\u30E9\u30D9\u30EB\u3092\u5358\u7D14\u30AF\u30EA\u30C3\u30AF\u3067\u53F3\u306E\u5206\u5272\u30DA\u30A4\u30F3\u306B\u958B\u304D\u307E\u3059(\u306A\u3051\u308C\u3070\u4F5C\u6210)\u3002Cmd/Ctrl+\u30AF\u30EA\u30C3\u30AF\u306E\u65E2\u5B9A\u52D5\u4F5C\u306F\u7DAD\u6301\u3055\u308C\u307E\u3059\u3002").addToggle((toggle) => toggle.setValue(this.plugin.settings.canvasLabelSplitEnabled).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Open canvas label in right split").setDesc("Single-click a file name label on Canvas to open it in the right split (created if needed). Cmd/Ctrl+click behavior is unchanged.").addToggle((toggle) => toggle.setValue(this.plugin.settings.canvasLabelSplitEnabled).onChange(async (value) => {
       this.plugin.settings.canvasLabelSplitEnabled = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u30C6\u30AD\u30B9\u30C8\u7DE8\u96C6\u7528\u30B9\u30AF\u30E9\u30C3\u30C1\u30D5\u30A9\u30EB\u30C0").setDesc("\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30C6\u30AD\u30B9\u30C8\u30AB\u30FC\u30C9\u3092\u5927\u30E2\u30FC\u30C0\u30EB\u3067\u7DE8\u96C6\u3059\u308B\u305F\u3081\u306E\u4F7F\u3044\u56DE\u3057\u30D5\u30A1\u30A4\u30EB\u306E\u7F6E\u304D\u5834\u6240\uFF08Vault\u76F8\u5BFE\u3001\u5168canvas\u5171\u6709\u30671\u4EF6\u30FB\u81EA\u52D5\u524A\u9664\u306A\u3057\uFF09\u3002\u691C\u7D22\u7B49\u306B\u7D1B\u308C\u306A\u3044\u3088\u3046\u300C\u8A2D\u5B9A\u2192\u30D5\u30A1\u30A4\u30EB\u3068\u30EA\u30F3\u30AF\u2192\u9664\u5916\u30D5\u30A1\u30A4\u30EB\u300D\u3078\u306E\u767B\u9332\u3092\u63A8\u5968\u3057\u307E\u3059\u3002").addText((text) => text.setPlaceholder(DEFAULT_SCRATCH_FOLDER).setValue(this.plugin.settings.scratchFolder).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Default location for new files").setDesc("Default folder for files created with the + button in Card View (vault-relative, empty means vault root). When a folder filter is active, that folder takes precedence. Missing folders are created automatically.").addText((text) => {
+      var _a;
+      return text.setPlaceholder("e.g. Inbox (empty = vault root)").setValue((_a = this.plugin.settings.newFileFolder) != null ? _a : "").onChange(async (value) => {
+        this.plugin.settings.newFileFolder = normalizeNewFileFolder(value);
+        await this.plugin.saveSettings();
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Scratch folder for text editing").setDesc("Location of the reusable file used to edit text cards inside a canvas in the large modal (vault-relative, one shared file for all canvases, never auto-deleted). To keep it out of search, we recommend adding it under Settings \u2192 Files and links \u2192 Excluded files.").addText((text) => text.setPlaceholder(DEFAULT_SCRATCH_FOLDER).setValue(this.plugin.settings.scratchFolder).onChange(async (value) => {
       this.plugin.settings.scratchFolder = normalizeScratchFolder(value);
       await this.plugin.saveSettings();
     }));

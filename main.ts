@@ -30,6 +30,8 @@ interface NoteMasonrySettings {
     canvasLabelSplitEnabled: boolean;
     /** テキストノード編集用の使い回しスクラッチファイルを置くフォルダ（Vault相対） */
     scratchFolder: string;
+    /** Card Viewの新規作成ボタンで使う既定の作成先フォルダ（Vault相対・空欄はVault直下） */
+    newFileFolder: string;
 }
 
 const DEFAULT_SCRATCH_FOLDER = '__masonry-scratch';
@@ -37,12 +39,18 @@ const DEFAULT_SCRATCH_FOLDER = '__masonry-scratch';
 const DEFAULT_SETTINGS: NoteMasonrySettings = {
     canvasLabelSplitEnabled: true,
     scratchFolder: DEFAULT_SCRATCH_FOLDER,
+    newFileFolder: '',
 };
 
 /** スクラッチフォルダ設定値を正規化する。空なら既定に戻す */
 function normalizeScratchFolder(raw: string): string {
     const cleaned = (raw ?? '').replace(/\\/g, '/').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
     return cleaned || DEFAULT_SCRATCH_FOLDER;
+}
+
+/** 新規ファイル作成先フォルダ設定値を正規化する。空欄はVault直下（''）として扱う */
+function normalizeNewFileFolder(raw: string): string {
+    return (raw ?? '').replace(/\\/g, '/').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
 }
 
 /**
@@ -210,10 +218,17 @@ class NoteEditModal {
         let isNewFile = false;
         if (!this.file) {
             const basePath = this.selectedFolder ? `${this.selectedFolder}/` : "";
+            // 作成先フォルダがなければ作る（設定の既定フォルダ直指定時など）
+            if (this.selectedFolder) {
+                const existing = this.app.vault.getAbstractFileByPath(this.selectedFolder);
+                if (!existing) {
+                    await this.app.vault.createFolder(this.selectedFolder);
+                }
+            }
             let newPath = `${basePath}Untitled.md`;
             let counter = 1;
             while (this.app.vault.getAbstractFileByPath(newPath)) {
-                newPath = `Untitled ${counter}.md`;
+                newPath = `${basePath}Untitled ${counter}.md`;
                 counter++;
             }
           this.file = await this.app.vault.create(newPath, "");
@@ -321,6 +336,8 @@ export class KeepView extends ItemView {
     private canvasFocusCycle: Record<string, number> = {};
     /** テキスト編集用スクラッチの格納フォルダ（KeepPluginから注入される） */
     scratchFolder: string = DEFAULT_SCRATCH_FOLDER;
+    /** 新規作成ボタンの既定作成先フォルダ（KeepPluginから注入される・空欄はVault直下） */
+    newFileFolder = '';
     private activeTextSession: { canvasPath: string; nodeId: string; baseText: string } | null = null;
     /** ページネーション・キャッシュ用 */
     private renderLimit = RENDER_INITIAL_LIMIT;
@@ -495,7 +512,7 @@ export class KeepView extends ItemView {
         this.createButton = createButton;
         setIcon(createButton, 'plus');
         createButton.addEventListener('click', () => {
-            this.openNoteModal(null, { selectedFolder: this.selectedFolder, selectedTag: this.selectedTag });
+            this.openNoteModal(null, { selectedFolder: this.getEffectiveNewFileFolder(), selectedTag: this.selectedTag });
         });
 
         this.canvasBanner = container.createEl('div', { cls: 'keep-canvas-banner' });
@@ -1270,6 +1287,16 @@ export class KeepView extends ItemView {
             this.normalizedScratchSource = this.scratchFolder;
         }
         return this.normalizedScratchCache;
+    }
+
+    /**
+     * 新規作成ボタンの実効的な作成先フォルダを返す。
+     * フォルダで絞り込み中はそのフォルダを優先し、未絞り込み(All folders)のときだけ
+     * 設定の既定フォルダを使う。空文字はVault直下を意味する。
+     */
+    getEffectiveNewFileFolder(): string {
+        if (this.selectedFolder) return this.selectedFolder;
+        return normalizeNewFileFolder(this.newFileFolder);
     }
 
     private isScratchFile(f: TFile): boolean {
@@ -2062,6 +2089,7 @@ export default class KeepPlugin extends Plugin {
         this.registerView(KEEP_VIEW_TYPE, (leaf) => {
             const view = new KeepView(leaf);
             view.scratchFolder = this.settings.scratchFolder;
+            view.newFileFolder = this.settings.newFileFolder ?? '';
             return view;
         });
         this.addRibbonIcon('layout-grid', 'Open note masonry', () => void this.activateView());
@@ -2083,18 +2111,20 @@ export default class KeepPlugin extends Plugin {
 
     async saveSettings() {
         this.settings.scratchFolder = normalizeScratchFolder(this.settings.scratchFolder);
+        this.settings.newFileFolder = normalizeNewFileFolder(this.settings.newFileFolder ?? '');
         await this.saveData(this.settings);
         this.updateBodyClass();
-        this.syncScratchFolderToViews();
+        this.syncSettingsToViews();
     }
 
     /** 設定変更を既存の全KeepViewへ反映する */
-    private syncScratchFolderToViews() {
+    private syncSettingsToViews() {
         try {
             for (const leaf of this.app.workspace.getLeavesOfType(KEEP_VIEW_TYPE)) {
                 const view = leaf.view as unknown as KeepView;
                 if (view instanceof KeepView) {
                     view.scratchFolder = this.settings.scratchFolder;
+                    view.newFileFolder = this.settings.newFileFolder ?? '';
                 }
             }
         } catch {
@@ -2334,8 +2364,8 @@ class NoteMasonrySettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
         new Setting(containerEl)
-            .setName('Canvasラベルクリックで右に開く')
-            .setDesc('Canvasのファイル名ラベルを単純クリックで右の分割ペインに開きます(なければ作成)。Cmd/Ctrl+クリックの既定動作は維持されます。')
+            .setName('Open canvas label in right split')
+            .setDesc('Single-click a file name label on Canvas to open it in the right split (created if needed). Cmd/Ctrl+click behavior is unchanged.')
             .addToggle((toggle) => toggle
                 .setValue(this.plugin.settings.canvasLabelSplitEnabled)
                 .onChange(async (value) => {
@@ -2343,8 +2373,18 @@ class NoteMasonrySettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
         new Setting(containerEl)
-            .setName('テキスト編集用スクラッチフォルダ')
-            .setDesc('キャンバス内のテキストカードを大モーダルで編集するための使い回しファイルの置き場所（Vault相対、全canvas共有で1件・自動削除なし）。検索等に紛れないよう「設定→ファイルとリンク→除外ファイル」への登録を推奨します。')
+            .setName('Default location for new files')
+            .setDesc('Default folder for files created with the + button in Card View (vault-relative, empty means vault root). When a folder filter is active, that folder takes precedence. Missing folders are created automatically.')
+            .addText((text) => text
+                .setPlaceholder('e.g. Inbox (empty = vault root)')
+                .setValue(this.plugin.settings.newFileFolder ?? '')
+                .onChange(async (value) => {
+                    this.plugin.settings.newFileFolder = normalizeNewFileFolder(value);
+                    await this.plugin.saveSettings();
+                }));
+        new Setting(containerEl)
+            .setName('Scratch folder for text editing')
+            .setDesc('Location of the reusable file used to edit text cards inside a canvas in the large modal (vault-relative, one shared file for all canvases, never auto-deleted). To keep it out of search, we recommend adding it under Settings → Files and links → Excluded files.')
             .addText((text) => text
                 .setPlaceholder(DEFAULT_SCRATCH_FOLDER)
                 .setValue(this.plugin.settings.scratchFolder)

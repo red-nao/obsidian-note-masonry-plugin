@@ -30,8 +30,9 @@ Note Masonry is an Obsidian plugin that shows your notes in a **Google Keep–st
 - Send-to-Canvas flow: uses the active Canvas if one is open, a picker when there are multiple Canvases, and auto-creates a Canvas when none exists
 
 ## Settings
-- **Open file label in right split on click:** plain-click a Canvas file label to open it in the right split pane
-- **Scratch folder for text editing:** Vault-relative folder for the shared `masonry-scratch.md` used to edit Canvas text cards (1 file shared by all Canvases, never auto-deleted). Scratch files are hidden from the grid, search, and random picks. Excluding this folder via `Settings → Files and links → Excluded files` is recommended
+- **Open canvas label in right split:** single-click a file name label on Canvas to open it in the right split pane (created if needed). Cmd/Ctrl+click behavior is unchanged
+- **Default location for new files:** default folder for files created with the + button in Card View (vault-relative, empty means vault root). When a folder filter is active, that folder takes precedence. Missing folders are created automatically
+- **Scratch folder for text editing:** Vault-relative folder for the shared `masonry-scratch.md` used to edit Canvas text cards (1 file shared by all Canvases, never auto-deleted). Scratch files are hidden from the grid, search, and random picks. To keep it out of search, adding it under `Settings → Files and links → Excluded files` is recommended
 
 ## Installation
 1. Put the built plugin files into your vault, e.g. `.obsidian/plugins/note-masonry`:
@@ -47,7 +48,7 @@ Note Masonry is an Obsidian plugin that shows your notes in a **Google Keep–st
 - Use the folder and tag dropdowns to filter notes (defaults to `#WIP` when present)
 - Use the **shuffle button** to show 15 random notes; click again (or change filters/search) to exit
 - Use the **search bar** at the top to filter notes by text in the title or body.
-- Click the **“+” button** to create a new note in a modal editor.
+- Click the **“+” button** to create a new note in a modal editor (created in the active folder filter, or in the default location for new files when no folder filter is set).
 - Click a card to open it in the modal (your hotkeys work there; `Esc` closes it).
 - Drag a card onto an open Canvas to drop it as a file node.
 - Right-click a card (or use the **three-dot menu**) for `Send to Canvas` / `Send to new Canvas` / `Delete`.
