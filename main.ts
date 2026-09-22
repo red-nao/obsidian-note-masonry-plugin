@@ -4,13 +4,47 @@ export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
 const RANDOM_FILE_COUNT = 15;
 
+/** canvas絞り込みモードで扱うカード種別。配置順維持のためnodeIndexを保持する */
+interface CanvasFileItem {
+    kind: 'file';
+    file: TFile;
+    nodeIndex: number;
+}
+
+interface CanvasTextItem {
+    kind: 'text';
+    nodeId: string;
+    text: string;
+    color?: string;
+    nodeIndex: number;
+}
+
+type CanvasGridItem = CanvasFileItem | CanvasTextItem;
+
 interface NoteMasonrySettings {
     canvasLabelSplitEnabled: boolean;
+    /** テキストノード編集用の使い回しスクラッチファイルを置くフォルダ（Vault相対） */
+    scratchFolder: string;
 }
+
+const DEFAULT_SCRATCH_FOLDER = '__masonry-scratch';
 
 const DEFAULT_SETTINGS: NoteMasonrySettings = {
     canvasLabelSplitEnabled: true,
+    scratchFolder: DEFAULT_SCRATCH_FOLDER,
 };
+
+/** スクラッチフォルダ設定値を正規化する。空なら既定に戻す */
+function normalizeScratchFolder(raw: string): string {
+    const cleaned = (raw ?? '').replace(/\\/g, '/').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
+    return cleaned || DEFAULT_SCRATCH_FOLDER;
+}
+
+/** ファイル名に使えない文字を取り除く */
+function sanitizeFileName(raw: string): string {
+    const cleaned = (raw ?? '').replace(/[\/\\:#|?*<>"]/g, '-').trim();
+    return cleaned || 'untitled';
+}
 
 /**
  * Obsidian標準の Modal はキーボードイベント処理を横取りするため、
@@ -32,6 +66,7 @@ class NoteEditModal {
     onCloseCallback: () => void;
     selectedFolder: string;
     selectedTag: string;
+    hideTitle: boolean;
     private prevActiveEditor: MarkdownFileInfo | null = null;
     private hasSavedActiveEditor = false;
     private pushedModalScope = false;
@@ -40,13 +75,14 @@ class NoteEditModal {
     private origGetActiveViewOfType: Workspace['getActiveViewOfType'] | null = null;
     private origGetActiveFile: Workspace['getActiveFile'] | null = null;
 
-    constructor(app: App, file: TFile | null, keepLeaf: WorkspaceLeaf, onCloseCallback: () => void, selectedFolder: string = '', selectedTag: string = '') {
+    constructor(app: App, file: TFile | null, keepLeaf: WorkspaceLeaf, onCloseCallback: () => void, selectedFolder: string = '', selectedTag: string = '', hideTitle = false) {
         this.app = app;
         this.file = file;
         this.keepLeaf = keepLeaf;
         this.onCloseCallback = onCloseCallback;
         this.selectedFolder = selectedFolder;
         this.selectedTag = selectedTag;
+        this.hideTitle = hideTitle;
         // Escで閉じる専用。親をapp.scopeにするので他ホットキーはフォールスルーする。
         this.scope = new Scope(this.app.scope);
         this.scope.register(null, "Escape", () => {
@@ -59,6 +95,7 @@ class NoteEditModal {
         this.bgEl = this.containerEl.createDiv({ cls: 'modal-bg keep-modal-bg' });
         this.bgEl.addEventListener('click', () => this.close());
         this.modalEl = this.containerEl.createDiv({ cls: 'modal keep-editor-modal' });
+        if (this.hideTitle) this.modalEl.addClass('keep-hide-title');
         this.contentEl = this.modalEl.createDiv({ cls: 'modal-content keep-editor-modal-content' });
     }
 
@@ -274,15 +311,24 @@ export class KeepView extends ItemView {
     tagSelect: HTMLSelectElement;
     searchInput: HTMLInputElement;
     randomButton: HTMLButtonElement;
+    private filterContainer: HTMLElement | null = null;
+    private leftFilters: HTMLElement | null = null;
+    private createButton: HTMLElement | null = null;
+    private canvasBanner: HTMLElement | null = null;
     private isRendering = false;
     private renderTimeout: NodeJS.Timeout | null = null;
     private hasAppliedDefaultTagFilter = false;
+    private canvasFocusCycle: Record<string, number> = {};
+    /** テキスト編集用スクラッチの格納フォルダ（KeepPluginから注入される） */
+    scratchFolder: string = DEFAULT_SCRATCH_FOLDER;
+    private activeTextSession: { canvasPath: string; nodeId: string; baseText: string } | null = null;
     
     selectedFolder: string = '';
     selectedTag: string = '';
     searchQuery: string = '';
     isRandomMode: boolean = false;
     randomFiles: TFile[] = [];
+    canvasSourcePath: string | null = null;
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -305,8 +351,13 @@ export class KeepView extends ItemView {
             ...super.getState(),
             selectedFolder: this.selectedFolder,
             selectedTag: this.selectedTag,
-            searchQuery: this.searchQuery
+            searchQuery: this.searchQuery,
+            canvasSourcePath: this.canvasSourcePath
         };
+    }
+
+    isCanvasMode(): boolean {
+        return !!this.canvasSourcePath;
     }
 
     async setState(state: Record<string, unknown>, result: Parameters<ItemView['setState']>[1]) {
@@ -320,9 +371,20 @@ export class KeepView extends ItemView {
         if (typeof state.searchQuery === 'string') {
             this.searchQuery = state.searchQuery;
         }
+        if (typeof state.canvasSourcePath === 'string' && state.canvasSourcePath) {
+            this.canvasSourcePath = state.canvasSourcePath;
+        } else if (state.canvasSourcePath === null || state.canvasSourcePath === '') {
+            this.canvasSourcePath = null;
+        }
         this.isRandomMode = false;
         this.randomFiles = [];
+        this.canvasFocusCycle = {};
         await super.setState(state, result);
+        this.updateCanvasModeUI();
+        if (this.searchInput && typeof this.searchQuery === 'string') {
+            this.searchInput.value = this.searchQuery;
+            this.updateSearchVisibility();
+        }
         this.requestRender();
     }
 
@@ -332,8 +394,10 @@ export class KeepView extends ItemView {
         container.addClass('keep-view-container');
 
         const filterContainer = container.createEl('div', { cls: 'keep-filter-container' });
+        this.filterContainer = filterContainer;
         
         const leftFilters = filterContainer.createEl('div', { cls: 'keep-filter-left' });
+        this.leftFilters = leftFilters;
     
         this.folderSelect = leftFilters.createEl('select', { cls: 'keep-select' });
         this.folderSelect.addEventListener('change', (e) => {
@@ -398,10 +462,14 @@ export class KeepView extends ItemView {
         const createButton = filterContainer.createEl('button', {
             cls: 'keep-create-button',
         });
+        this.createButton = createButton;
         setIcon(createButton, 'plus');
         createButton.addEventListener('click', () => {
             new NoteEditModal(this.app, null, this.leaf, () => this.requestRender(), this.selectedFolder, this.selectedTag).open();
         });
+
+        this.canvasBanner = container.createEl('div', { cls: 'keep-canvas-banner' });
+        this.canvasBanner.hide();
     
         this.gridContainer = container.createEl('div', { cls: 'keep-grid-wrapper' });
 
@@ -411,7 +479,109 @@ export class KeepView extends ItemView {
         this.registerEvent(this.app.vault.on('rename', () => this.requestRender()));
         this.registerEvent(this.app.metadataCache.on('changed', () => this.requestRender()));
 
+        this.updateCanvasModeUI();
         await this.renderGrid();
+    }
+
+    /** canvasモードではフォルダ/タグ/ランダム/新規作成を隠し、検索バーのみ＋バナーを表示する */
+    updateCanvasModeUI() {
+        const canvasMode = this.isCanvasMode();
+        if (this.leftFilters) {
+            this.leftFilters.style.display = canvasMode ? 'none' : '';
+        }
+        if (this.randomButton) {
+            this.randomButton.style.display = canvasMode ? 'none' : '';
+        }
+        if (this.createButton) {
+            this.createButton.style.display = canvasMode ? 'none' : '';
+        }
+        if (this.canvasBanner) {
+            this.canvasBanner.empty();
+            if (canvasMode && this.canvasSourcePath) {
+                this.canvasBanner.show();
+                const label = this.canvasBanner.createEl('span', {
+                    cls: 'keep-canvas-banner-label',
+                    text: `Filtered by ${this.canvasSourcePath}`,
+                });
+                label.setAttr('title', this.canvasSourcePath);
+                const clearBtn = this.canvasBanner.createEl('button', {
+                    cls: 'keep-canvas-banner-clear',
+                    attr: { 'aria-label': 'Clear canvas filter' },
+                });
+                setIcon(clearBtn, 'x');
+                clearBtn.addEventListener('click', () => {
+                    this.canvasSourcePath = null;
+                    this.canvasFocusCycle = {};
+                    this.updateCanvasModeUI();
+                    this.requestRender();
+                });
+            } else {
+                this.canvasBanner.hide();
+            }
+        }
+    }
+
+    private getCanvasSourceFile(): TFile | null {
+        if (!this.canvasSourcePath) return null;
+        const f = this.app.vault.getAbstractFileByPath(this.canvasSourcePath);
+        return f instanceof TFile ? f : null;
+    }
+
+    /** .canvas JSONからfile/textノードを取り出す（link/groupは除外）。配置順維持のためnodeIndexを付与する */
+    private async loadCanvasGridItems(canvasFile: TFile): Promise<CanvasGridItem[]> {
+        let raw = '';
+        try {
+            raw = await this.app.vault.read(canvasFile);
+        } catch {
+            return [];
+        }
+        try {
+            const data = JSON.parse(raw) as { nodes?: unknown };
+            if (!data || !Array.isArray(data.nodes)) return [];
+            const fileSeen = new Set<string>();
+            const fileByKey = new Map<string, { file: TFile; nodeIndex: number }>();
+            const texts: CanvasTextItem[] = [];
+            data.nodes.forEach((n, index) => {
+                const node = n as { type?: unknown; file?: unknown; id?: unknown; text?: unknown; color?: unknown };
+                if (!node || typeof node.type !== 'string') return;
+                if (node.type === 'file' && typeof node.file === 'string' && node.file) {
+                    let f = this.app.vault.getAbstractFileByPath(node.file);
+                    if (!(f instanceof TFile)) {
+                        try {
+                            const dest = this.app.metadataCache.getFirstLinkpathDest(node.file, canvasFile.path);
+                            if (dest instanceof TFile) f = dest;
+                        } catch {
+                            // ignore
+                        }
+                    }
+                    if (f instanceof TFile && !fileSeen.has(f.path)) {
+                        fileSeen.add(f.path);
+                        fileByKey.set(f.path, { file: f, nodeIndex: index });
+                    }
+                } else if (node.type === 'text' && typeof node.id === 'string' && typeof node.text === 'string') {
+                    texts.push({
+                        kind: 'text',
+                        nodeId: node.id,
+                        text: node.text,
+                        color: typeof node.color === 'string' ? node.color : undefined,
+                        nodeIndex: index,
+                    });
+                }
+            });
+            const items: CanvasGridItem[] = [];
+            for (const { file, nodeIndex } of fileByKey.values()) {
+                items.push({ kind: 'file', file, nodeIndex });
+            }
+            for (const t of texts) items.push(t);
+            items.sort((a, b) => a.nodeIndex - b.nodeIndex);
+            return items;
+        } catch {
+            return [];
+        }
+    }
+
+    private isMarkdownFile(file: TFile): boolean {
+        return file.extension === 'md';
     }
 
     updateSearchVisibility() {
@@ -452,7 +622,7 @@ export class KeepView extends ItemView {
     }
 
     showRandomFiles() {
-        const all = this.app.vault.getMarkdownFiles();
+        const all = this.app.vault.getMarkdownFiles().filter((f) => !this.isScratchFile(f));
         for (let i = all.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [all[i], all[j]] = [all[j], all[i]];
@@ -539,6 +709,11 @@ export class KeepView extends ItemView {
         this.isRendering = true;
 
         try {
+            this.updateCanvasModeUI();
+            if (this.isCanvasMode()) {
+                await this.renderCanvasGrid();
+                return;
+            }
             this.applyDefaultTagFilter();
             this.updateFilterUI();
             this.updateRandomButtonState();
@@ -547,9 +722,9 @@ export class KeepView extends ItemView {
 
             if (this.isRandomMode) {
                 const existingPaths = new Set(this.app.vault.getMarkdownFiles().map(f => f.path));
-                files = this.randomFiles.filter(f => existingPaths.has(f.path));
+                files = this.randomFiles.filter(f => existingPaths.has(f.path) && !this.isScratchFile(f));
             } else {
-                let filtered = this.app.vault.getMarkdownFiles();
+                let filtered = this.app.vault.getMarkdownFiles().filter((f) => !this.isScratchFile(f));
                 
                 if (this.selectedFolder) {
                     filtered = filtered.filter(f => f.parent?.path === this.selectedFolder || f.parent?.path.startsWith(this.selectedFolder + '/'));
@@ -622,26 +797,394 @@ export class KeepView extends ItemView {
         }
     }
 
-    async renderCards(files: TFile[], container: HTMLElement) {
-        const fragment = document.createDocumentFragment();
-        for (const file of files) {
+    /** canvasモード専用: そのcanvas内のfile/textノードを配置順で表示し、検索バーで絞り込む */
+    private async renderCanvasGrid() {
+        this.gridContainer.empty();
+        const canvasFile = this.getCanvasSourceFile();
+        if (!canvasFile || canvasFile.extension !== 'canvas') {
+            this.gridContainer.createEl('div', {
+                text: this.canvasSourcePath
+                    ? `Canvas not found: ${this.canvasSourcePath}`
+                    : 'No canvas selected.',
+                cls: 'keep-empty-message',
+            });
+            return;
+        }
+        let items = await this.loadCanvasGridItems(canvasFile);
+
+        if (this.searchQuery) {
+            const query = this.searchQuery.toLowerCase();
+            const results = await Promise.all(items.map((item) => {
+                if (item.kind === 'file') return this.matchesCanvasSearch(item.file, query);
+                return Promise.resolve(item.text.toLowerCase().includes(query));
+            }));
+            items = items.filter((_, i) => results[i]);
+        }
+
+        if (items.length === 0) {
+            this.gridContainer.createEl('div', {
+                text: 'このキャンバスに表示できるファイルがありません。',
+                cls: 'keep-empty-message',
+            });
+            return;
+        }
+        const grid = this.gridContainer.createEl('div', { cls: 'keep-grid' });
+        await this.renderCanvasCards(items, grid);
+    }
+
+    private async matchesCanvasSearch(file: TFile, query: string): Promise<boolean> {
+        if (file.basename.toLowerCase().includes(query)) return true;
+        if (file.path.toLowerCase().includes(query)) return true;
+        if (!this.isMarkdownFile(file)) return false;
+        try {
             const content = await this.app.vault.cachedRead(file);
             const cache = this.app.metadataCache.getFileCache(file);
-            
-            let contentWithoutFrontmatter = content;
+            let body = content;
             if (cache?.frontmatterPosition) {
-                contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
+                body = content.substring(cache.frontmatterPosition.end.offset);
             } else {
-                contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
+                body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+            }
+            return body.toLowerCase().includes(query);
+        } catch {
+            return false;
+        }
+    }
+
+    /** canvasモード専用の混在グリッド描画（配置順）。fileは既存カード、textはタイトルなし＋その場編集 */
+    private async renderCanvasCards(items: CanvasGridItem[], container: HTMLElement) {
+        const filesOnly = items.every((i) => i.kind === 'file');
+        if (filesOnly) {
+            await this.renderCards(items.map((i) => (i as CanvasFileItem).file), container);
+            return;
+        }
+        const fragment = document.createDocumentFragment();
+        for (const item of items) {
+            if (item.kind === 'file') {
+                await this.buildCanvasFileCard(item.file, fragment);
+            } else {
+                this.buildCanvasTextCard(item, fragment);
+            }
+        }
+        container.appendChild(fragment);
+    }
+
+    /** canvasモードのファイルカード1件分（renderCardsのcanvas分岐と同等。split残存／pin・menu・DnDなし） */
+    private async buildCanvasFileCard(file: TFile, fragment: DocumentFragment) {
+        const isMd = this.isMarkdownFile(file);
+        let contentWithoutFrontmatter = '';
+        if (isMd) {
+            try {
+                const content = await this.app.vault.cachedRead(file);
+                const cache = this.app.metadataCache.getFileCache(file);
+                if (cache?.frontmatterPosition) {
+                    contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
+                } else {
+                    contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
+                }
+            } catch {
+                contentWithoutFrontmatter = '';
+            }
+        }
+        const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
+        const images: string[] = [];
+        let match;
+        if (isMd) {
+            while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
+                const url = match[1] || match[2];
+                if (url) images.push(url);
+            }
+        }
+        const resolvedImages = images.map((img) => {
+            if (img.startsWith('http://') || img.startsWith('https://') || img.startsWith('app://') || img.startsWith('data:')) {
+                return img;
+            }
+            const linkedFile = this.app.metadataCache.getFirstLinkpathDest(img, file.path);
+            if (linkedFile) return this.app.vault.getResourcePath(linkedFile);
+            return null;
+        }).filter((img): img is string => img !== null);
+        if (!isMd && this.isImageFile(file)) {
+            try {
+                resolvedImages.unshift(this.app.vault.getResourcePath(file));
+            } catch {
+                // ignore
+            }
+        }
+        const snippetText = isMd
+            ? contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, '').trim()
+            : `${file.extension.toUpperCase()} • ${file.path}`;
+        const snippet = isMd
+            ? snippetText.substring(0, 250) + (snippetText.length > 250 ? '...' : '')
+            : snippetText;
+
+        const card = fragment.createEl('div', { cls: 'keep-card' });
+        card.draggable = false;
+        if (resolvedImages.length > 0) {
+            const imgContainer = card.createEl('div', { cls: `keep-card-images keep-card-images-${Math.min(resolvedImages.length, 2)}` });
+            resolvedImages.slice(0, 2).forEach((img) => {
+                const imgEl = imgContainer.createEl('img', { attr: { src: img } });
+                imgEl.draggable = false;
+            });
+        }
+        const splitBtn = card.createEl('button', {
+            cls: 'keep-split-btn',
+            attr: { 'aria-label': 'Open in split view' },
+        });
+        setIcon(splitBtn, 'panel-right');
+        const splitSvg = splitBtn.querySelector('svg');
+        if (splitSvg) {
+            splitSvg.setAttribute('fill', 'none');
+            splitSvg.setAttribute('stroke', 'currentColor');
+        }
+        splitBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const leaf = this.app.workspace.getLeaf('split');
+            void leaf.openFile(file);
+        });
+        if (file.basename) {
+            card.createEl('h3', { text: file.basename, cls: 'keep-card-title' });
+        }
+        if (snippet) {
+            card.createEl('div', { text: snippet, cls: 'keep-card-snippet' });
+        }
+        card.addEventListener('click', (e: MouseEvent) => {
+            if (e.metaKey || e.ctrlKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                void this.focusCanvasNode(file);
+                return;
+            }
+            if (isMd) {
+                new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+            } else {
+                const leaf = this.app.workspace.getLeaf('tab');
+                void leaf.openFile(file);
+            }
+        });
+    }
+
+    /** テキストカード1件分。タイトルなし・全文スニペットのみ。通常クリックで大モーダル編集、Cmd+クリックでフォーカス */
+    private buildCanvasTextCard(item: CanvasTextItem, fragment: DocumentFragment) {
+        const card = fragment.createEl('div', { cls: 'keep-card keep-text-card' });
+        card.draggable = false;
+        card.setAttr('data-canvas-node-id', item.nodeId);
+        const body = item.text.trim();
+        const snippet = body.length > 250 ? body.substring(0, 250) + '...' : body;
+        card.createEl('div', {
+            text: snippet || '(空のテキストカード)',
+            cls: 'keep-card-snippet keep-text-snippet',
+        });
+        card.addEventListener('click', (e: MouseEvent) => {
+            if (e.metaKey || e.ctrlKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                void this.focusCanvasNodeById(item.nodeId);
+                return;
+            }
+            void this.openCanvasTextModal(item);
+        });
+    }
+
+    private getScratchFolder(): string {
+        return normalizeScratchFolder(this.scratchFolder);
+    }
+
+    private isScratchFile(f: TFile): boolean {
+        const folder = this.getScratchFolder();
+        return folder ? f.path === folder || f.path.startsWith(folder + '/') : false;
+    }
+
+    private async ensureScratchFolder(folder: string): Promise<void> {
+        if (!folder) return;
+        const existing = this.app.vault.getAbstractFileByPath(folder);
+        if (existing) {
+            if (existing instanceof TFolder) return;
+            throw new Error(`Scratch folder path is occupied by a file: ${folder}`);
+        }
+        await this.app.vault.createFolder(folder);
+    }
+
+    /**
+     * canvasごとの使い回しスクラッチファイルを取得する。なければ作成する。
+     * 毎回の作成・削除は行わない。
+     */
+    private async getScratchFile(canvasFile: TFile): Promise<TFile> {
+        const folder = this.getScratchFolder();
+        await this.ensureScratchFolder(folder);
+        const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
+        const path = folder ? `${folder}/${name}` : name;
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) return existing;
+        if (existing) {
+            throw new Error(`Scratch file path is occupied: ${path}`);
+        }
+        return await this.app.vault.create(path, '');
+    }
+
+    /**
+     * テキストノードを通常ファイルと同じ大モーダルで編集する。
+     * スクラッチに本文を流し込んでNoteEditModalで開き、close時にcanvasへ書き戻す。
+     */
+    async openCanvasTextModal(item: CanvasTextItem): Promise<void> {
+        try {
+            const canvasFile = this.getCanvasSourceFile();
+            if (!canvasFile) {
+                new Notice('Canvasが見つかりません');
+                return;
+            }
+            await this.flushActiveTextSession();
+            const scratch = await this.getScratchFile(canvasFile);
+            let current = '';
+            try {
+                current = await this.app.vault.read(scratch);
+            } catch {
+                current = '';
+            }
+            if (current !== item.text) {
+                await this.app.vault.modify(scratch, item.text);
+            }
+            const baseText = item.text;
+            this.activeTextSession = { canvasPath: canvasFile.path, nodeId: item.nodeId, baseText };
+            new NoteEditModal(this.app, scratch, this.leaf, () => {
+                void this.onTextModalClose(canvasFile, item.nodeId, baseText);
+            }, '', '', true).open();
+        } catch (e) {
+            console.error('Open canvas text modal failed', e);
+            new Notice('テキストの編集を開けませんでした');
+        }
+    }
+
+    /** モーダルclose時の書き戻し。エディタの自動保存を待ってからスクラッチ→canvasへ反映する */
+    private async onTextModalClose(canvasFile: TFile, nodeId: string, baseText: string): Promise<void> {
+        try {
+            // エディタの自動保存フラッシュを待つ
+            await new Promise((r) => window.setTimeout(r, 300));
+            const folder = this.getScratchFolder();
+            const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
+            const scratchPath = folder ? `${folder}/${name}` : name;
+            const scratch = this.app.vault.getAbstractFileByPath(scratchPath);
+            if (scratch instanceof TFile) {
+                let scratchText = '';
+                try {
+                    scratchText = await this.app.vault.read(scratch);
+                } catch {
+                    scratchText = '';
+                }
+                await this.writeScratchBackToNode(canvasFile, nodeId, baseText, scratchText);
+            }
+        } catch (e) {
+            console.error('Save canvas text from modal failed', e);
+            new Notice('テキストカードの更新に失敗しました');
+        } finally {
+            if (this.activeTextSession?.nodeId === nodeId) {
+                this.activeTextSession = null;
+            }
+            this.requestRender();
+        }
+    }
+
+    /** スクラッチ内容をcanvasノードへ書き戻す。canvas側でも変わっていれば上書き＋通知する */
+    private async writeScratchBackToNode(canvasFile: TFile, nodeId: string, baseText: string, scratchText: string): Promise<boolean> {
+        const raw = await this.app.vault.read(canvasFile);
+        const data = JSON.parse(raw) as { nodes?: Array<{ id?: unknown; type?: unknown; text?: unknown }> };
+        if (!data || !Array.isArray(data.nodes)) return false;
+        const node = data.nodes.find((n) => n && n.id === nodeId && n.type === 'text');
+        if (!node || typeof node.text !== 'string') return false;
+        if (node.text === scratchText) return true;
+        if (node.text !== baseText) {
+            new Notice('Canvas側でも変更がありました。上書きしました');
+        }
+        node.text = scratchText;
+        await this.app.vault.modify(canvasFile, JSON.stringify(data, null, 2));
+        return true;
+    }
+
+    /** 残存セッションがあれば書き戻す（モーダル排他のため通常は空のはずだが安全のため） */
+    private async flushActiveTextSession(): Promise<void> {
+        const session = this.activeTextSession;
+        if (!session) return;
+        try {
+            const canvasFile = this.app.vault.getAbstractFileByPath(session.canvasPath);
+            if (!(canvasFile instanceof TFile)) {
+                this.activeTextSession = null;
+                return;
+            }
+            const folder = this.getScratchFolder();
+            const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
+            const scratch = this.app.vault.getAbstractFileByPath(folder ? `${folder}/${name}` : name);
+            if (scratch instanceof TFile) {
+                const scratchText = await this.app.vault.read(scratch);
+                await this.writeScratchBackToNode(canvasFile, session.nodeId, session.baseText, scratchText);
+            }
+        } catch (e) {
+            console.error('Flush text session failed', e);
+        } finally {
+            this.activeTextSession = null;
+        }
+    }
+
+    /** ノードID指定でキャンバス上のテキストカードへフォーカスする（単一ノード想定） */
+    async focusCanvasNodeById(nodeId: string): Promise<void> {
+        try {
+            const canvasPath = this.canvasSourcePath;
+            if (!canvasPath) return;
+            const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (!(canvasFile instanceof TFile)) {
+                new Notice(`Canvas not found: ${canvasPath}`);
+                return;
+            }
+            const leaf = await this.ensureCanvasLeafOpen(canvasFile);
+            if (!leaf) {
+                new Notice('Canvasを開けませんでした');
+                return;
+            }
+            const canvas = await this.waitForCanvasNodes(leaf);
+            if (!canvas?.nodes) {
+                new Notice('Canvasの読み込みに失敗しました');
+                return;
+            }
+            const node = canvas.nodes.get(nodeId);
+            if (!node) {
+                new Notice('Canvas上に見つかりません（未保存の可能性があります）');
+                return;
+            }
+            this.applyCanvasFocus(canvas, node);
+        } catch (e) {
+            console.error('Focus canvas node failed', e);
+            new Notice('Canvasへのフォーカスに失敗しました');
+        }
+    }
+
+    async renderCards(files: TFile[], container: HTMLElement) {
+        const fragment = document.createDocumentFragment();
+        const canvasMode = this.isCanvasMode();
+        for (const file of files) {
+            const isMd = this.isMarkdownFile(file);
+            let contentWithoutFrontmatter = '';
+            let cache: ReturnType<App['metadataCache']['getFileCache']> = null;
+            if (isMd) {
+                try {
+                    const content = await this.app.vault.cachedRead(file);
+                    cache = this.app.metadataCache.getFileCache(file);
+                    if (cache?.frontmatterPosition) {
+                        contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
+                    } else {
+                        contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
+                    }
+                } catch {
+                    contentWithoutFrontmatter = '';
+                }
             }
 
             const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
             const images: string[] = [];
             let match;
-            while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
-                const url = match[1] || match[2];
-                if (url) {
-                    images.push(url);
+            if (isMd) {
+                while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
+                    const url = match[1] || match[2];
+                    if (url) {
+                        images.push(url);
+                    }
                 }
             }
 
@@ -656,44 +1199,59 @@ export class KeepView extends ItemView {
                 return null;
             }).filter((img): img is string => img !== null);
 
-            const snippetText = contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, '').trim();
-            const snippet = snippetText.substring(0, 250) + (snippetText.length > 250 ? '...' : '');
+            // 非mdの画像ファイル自体はプレビュー表示する
+            if (!isMd && this.isImageFile(file)) {
+                try {
+                    resolvedImages.unshift(this.app.vault.getResourcePath(file));
+                } catch {
+                    // ignore
+                }
+            }
+
+            const snippetText = isMd
+                ? contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, '').trim()
+                : `${file.extension.toUpperCase()} • ${file.path}`;
+            const snippet = isMd
+                ? snippetText.substring(0, 250) + (snippetText.length > 250 ? '...' : '')
+                : snippetText;
 
             const card = fragment.createEl('div', { cls: 'keep-card' });
-            card.draggable = true;
+            card.draggable = !canvasMode;
             let cardWasDragged = false;
-            card.addEventListener('dragstart', (e: DragEvent) => {
-                cardWasDragged = true;
-                card.addClass('is-dragging');
-                try {
-                    const dm = (this.app as unknown as { dragManager?: {
-                        dragFile?: (evt: DragEvent, file: TFile) => unknown;
-                        onDragStart?: (evt: DragEvent, info: unknown) => void;
-                    } }).dragManager;
-                    if (dm?.dragFile && dm?.onDragStart) {
-                        // dragFile()はdataTransferにobsidian://URLを積んだ上で内部用ドラッグ情報を返す。
-                        // それをonDragStart()に渡さないとCanvasのhandleDrop受け口が
-                        // 内部fileドロップとして認識できず、URLのリンクカードになってしまう。
-                        const info = dm.dragFile(e, file);
-                        if (info) dm.onDragStart(e, info);
-                    } else if (dm?.dragFile) {
-                        dm.dragFile(e, file);
-                    } else if (e.dataTransfer) {
-                        e.dataTransfer.effectAllowed = 'copy';
-                        try { e.dataTransfer.setData('text/plain', file.path); } catch { /* ignore */ }
+            if (!canvasMode) {
+                card.addEventListener('dragstart', (e: DragEvent) => {
+                    cardWasDragged = true;
+                    card.addClass('is-dragging');
+                    try {
+                        const dm = (this.app as unknown as { dragManager?: {
+                            dragFile?: (evt: DragEvent, file: TFile) => unknown;
+                            onDragStart?: (evt: DragEvent, info: unknown) => void;
+                        } }).dragManager;
+                        if (dm?.dragFile && dm?.onDragStart) {
+                            // dragFile()はdataTransferにobsidian://URLを積んだ上で内部用ドラッグ情報を返す。
+                            // それをonDragStart()に渡さないとCanvasのhandleDrop受け口が
+                            // 内部fileドロップとして認識できず、URLのリンクカードになってしまう。
+                            const info = dm.dragFile(e, file);
+                            if (info) dm.onDragStart(e, info);
+                        } else if (dm?.dragFile) {
+                            dm.dragFile(e, file);
+                        } else if (e.dataTransfer) {
+                            e.dataTransfer.effectAllowed = 'copy';
+                            try { e.dataTransfer.setData('text/plain', file.path); } catch { /* ignore */ }
+                        }
+                    } catch {
+                        // 非公開APIが無い/変わってもDnD以外は壊さない
                     }
-                } catch {
-                    // 非公開APIが無い/変わってもDnD以外は壊さない
-                }
-            });
-            card.addEventListener('dragend', () => {
-                card.removeClass('is-dragging');
-                window.setTimeout(() => { cardWasDragged = false; }, 150);
-            });
+                });
+                card.addEventListener('dragend', () => {
+                    card.removeClass('is-dragging');
+                    window.setTimeout(() => { cardWasDragged = false; }, 150);
+                });
+            }
             
             if (resolvedImages.length > 0) {
-                const imgContainer = card.createEl('div', { cls: `keep-card-images keep-card-images-${resolvedImages.length}` });
-                resolvedImages.forEach(img => {
+                const imgContainer = card.createEl('div', { cls: `keep-card-images keep-card-images-${Math.min(resolvedImages.length, 2)}` });
+                resolvedImages.slice(0, 2).forEach(img => {
                     const imgEl = imgContainer.createEl('img', { attr: { src: img } });
                     imgEl.draggable = false;
                 });
@@ -717,57 +1275,59 @@ export class KeepView extends ItemView {
                 void leaf.openFile(file);
             });
 
-            const pinBtn = card.createEl('button', { cls: 'keep-pin-btn' });
-            setIcon(pinBtn, 'pin');
-          
-            const svg = pinBtn.querySelector('svg');
-            if (svg) {
-                svg.setAttribute('fill', 'none');
-                svg.setAttribute('stroke', 'currentColor');
-            }
-            
-            const isPinned = cache?.frontmatter?.pinned === true;
-            
-            if (isPinned) {
-                pinBtn.addClass('is-pinned');
-                if (svg) {
-                    svg.setAttribute('fill', 'currentColor');
-                }
-            }
-          
-            pinBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                void this.app.fileManager.processFrontMatter(file, (fm) => {
-                    fm.pinned = !isPinned;
-                });
-            });
+            if (!canvasMode) {
+                const pinBtn = card.createEl('button', { cls: 'keep-pin-btn' });
+                setIcon(pinBtn, 'pin');
 
-            const menuBtn = card.createEl('button', {
-                cls: 'keep-menu-btn',
-                attr: { 'aria-label': 'Card menu' }
-            });
-            setIcon(menuBtn, 'more-horizontal');
-            
-            const menuSvg = menuBtn.querySelector('svg');
-            if (menuSvg) {
-                menuSvg.setAttribute('fill', 'none');
-                menuSvg.setAttribute('stroke', 'currentColor');
-            }
-            
-            menuBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const menu = new Menu();
-                menu.addItem((item) => {
-                    item.setTitle('Delete')
-                        .setIcon('trash')
-                        .onClick(() => {
-                            void this.app.fileManager.trashFile(file).then(() => {
-                                this.requestRender();
-                            });
-                        });
+                const svg = pinBtn.querySelector('svg');
+                if (svg) {
+                    svg.setAttribute('fill', 'none');
+                    svg.setAttribute('stroke', 'currentColor');
+                }
+
+                const isPinned = cache?.frontmatter?.pinned === true;
+
+                if (isPinned) {
+                    pinBtn.addClass('is-pinned');
+                    if (svg) {
+                        svg.setAttribute('fill', 'currentColor');
+                    }
+                }
+
+                pinBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    void this.app.fileManager.processFrontMatter(file, (fm) => {
+                        fm.pinned = !isPinned;
+                    });
                 });
-                menu.showAtMouseEvent(e);
-            });
+
+                const menuBtn = card.createEl('button', {
+                    cls: 'keep-menu-btn',
+                    attr: { 'aria-label': 'Card menu' }
+                });
+                setIcon(menuBtn, 'more-horizontal');
+
+                const menuSvg = menuBtn.querySelector('svg');
+                if (menuSvg) {
+                    menuSvg.setAttribute('fill', 'none');
+                    menuSvg.setAttribute('stroke', 'currentColor');
+                }
+
+                menuBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const menu = new Menu();
+                    menu.addItem((item) => {
+                        item.setTitle('Delete')
+                            .setIcon('trash')
+                            .onClick(() => {
+                                void this.app.fileManager.trashFile(file).then(() => {
+                                    this.requestRender();
+                                });
+                            });
+                    });
+                    menu.showAtMouseEvent(e);
+                });
+            }
 
             if (file.basename) {
                 card.createEl('h3', { text: file.basename, cls: 'keep-card-title' });
@@ -777,42 +1337,203 @@ export class KeepView extends ItemView {
                 card.createEl('div', { text: snippet, cls: 'keep-card-snippet' });
             }
 
-            card.addEventListener('click', () => {
+            card.addEventListener('click', (e: MouseEvent) => {
                 if (cardWasDragged) {
                     cardWasDragged = false;
                     return;
                 }
-                new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+                if (canvasMode && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void this.focusCanvasNode(file);
+                    return;
+                }
+                if (isMd) {
+                    new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+                } else {
+                    const leaf = this.app.workspace.getLeaf('tab');
+                    void leaf.openFile(file);
+                }
             });
 
-            card.addEventListener('contextmenu', (e: MouseEvent) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const menu = new Menu();
-                menu.addItem((item) => {
-                    item.setTitle('Send to Canvas')
-                        .setIcon('layout-dashboard')
-                        .onClick(() => void this.sendFileToCanvas(file));
-                });
-                menu.addItem((item) => {
-                    item.setTitle('Send to new Canvas')
-                        .setIcon('plus')
-                        .onClick(() => void this.createCanvasAndAdd(file));
-                });
-                menu.addSeparator();
-                menu.addItem((item) => {
-                    item.setTitle('Delete')
-                        .setIcon('trash')
-                        .onClick(() => {
-                            void this.app.fileManager.trashFile(file).then(() => {
-                                this.requestRender();
+            if (!canvasMode) {
+                card.addEventListener('contextmenu', (e: MouseEvent) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const menu = new Menu();
+                    menu.addItem((item) => {
+                        item.setTitle('Send to Canvas')
+                            .setIcon('layout-dashboard')
+                            .onClick(() => void this.sendFileToCanvas(file));
+                    });
+                    menu.addItem((item) => {
+                        item.setTitle('Send to new Canvas')
+                            .setIcon('plus')
+                            .onClick(() => void this.createCanvasAndAdd(file));
+                    });
+                    menu.addSeparator();
+                    menu.addItem((item) => {
+                        item.setTitle('Delete')
+                            .setIcon('trash')
+                            .onClick(() => {
+                                void this.app.fileManager.trashFile(file).then(() => {
+                                    this.requestRender();
+                                });
                             });
-                        });
+                    });
+                    menu.showAtMouseEvent(e);
                 });
-                menu.showAtMouseEvent(e);
-            });
+            }
         }
         container.appendChild(fragment);
+    }
+
+    private isImageFile(file: TFile): boolean {
+        return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(file.extension.toLowerCase());
+    }
+
+    /**
+     * Cmd/Ctrl+クリックでキャンバス上の該当ノードへフォーカスする。
+     * 同一ファイルの複数ノードは1件ずつサイクルし、canvasが閉じていれば開き直す。
+     */
+    async focusCanvasNode(file: TFile): Promise<void> {
+        try {
+            const canvasPath = this.canvasSourcePath;
+            if (!canvasPath) return;
+            const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+            if (!(canvasFile instanceof TFile)) {
+                new Notice(`Canvas not found: ${canvasPath}`);
+                return;
+            }
+            const leaf = await this.ensureCanvasLeafOpen(canvasFile);
+            if (!leaf) {
+                new Notice('Canvasを開けませんでした');
+                return;
+            }
+            const canvas = await this.waitForCanvasNodes(leaf);
+            if (!canvas) {
+                new Notice('Canvasの読み込みに失敗しました');
+                return;
+            }
+            const matches = this.findCanvasNodesForFile(canvas, file);
+            if (matches.length === 0) {
+                new Notice('Canvas上に見つかりません（未保存の可能性があります）');
+                return;
+            }
+            const prev = this.canvasFocusCycle[file.path] ?? -1;
+            const next = (prev + 1) % matches.length;
+            this.canvasFocusCycle[file.path] = next;
+            const node = matches[next];
+            this.applyCanvasFocus(canvas, node);
+        } catch (e) {
+            console.error('Focus canvas node failed', e);
+            new Notice('Canvasへのフォーカスに失敗しました');
+        }
+    }
+
+    private applyCanvasFocus(canvas: { nodes?: Map<string, unknown> }, node: unknown) {
+        const c = canvas as unknown as {
+            deselectAll?: () => void;
+            select?: (n: unknown) => void;
+            selectOnly?: (n: unknown) => void;
+            zoomToSelection?: () => void;
+            zoomToBbox?: (bbox: unknown) => void;
+        };
+        const n = node as { focus?: () => void; x?: number; y?: number; width?: number; height?: number };
+        try {
+            if (typeof c.deselectAll === 'function') c.deselectAll();
+            if (typeof c.selectOnly === 'function') c.selectOnly(node);
+            else if (typeof c.select === 'function') c.select(node);
+            if (typeof n.focus === 'function') {
+                try { n.focus(); } catch { /* ignore */ }
+            }
+            if (typeof c.zoomToSelection === 'function') {
+                c.zoomToSelection();
+            } else if (typeof c.zoomToBbox === 'function') {
+                if (typeof n.x === 'number' && typeof n.y === 'number') {
+                    const w = typeof n.width === 'number' ? n.width : 400;
+                    const h = typeof n.height === 'number' ? n.height : 300;
+                    c.zoomToBbox({ minX: n.x - w * 0.5, minY: n.y - h * 0.5, maxX: n.x + w * 1.5, maxY: n.y + h * 1.5 });
+                }
+            }
+        } catch (e) {
+            console.error('Focus canvas node failed', e);
+            new Notice('Canvasへのフォーカスに失敗しました');
+        }
+    }
+
+    private async ensureCanvasLeafOpen(canvasFile: TFile): Promise<WorkspaceLeaf | null> {
+        try {
+            const leaves = this.app.workspace.getLeavesOfType('canvas');
+            for (const leaf of leaves) {
+                try {
+                    const f = (leaf.view as unknown as { file?: TFile }).file;
+                    if (f?.path === canvasFile.path) {
+                        await this.app.workspace.revealLeaf(leaf);
+                        return leaf;
+                    }
+                } catch {
+                    // 次のleafを試す
+                }
+            }
+            const leaf = this.app.workspace.getLeaf('tab');
+            await leaf.openFile(canvasFile);
+            await this.app.workspace.revealLeaf(leaf);
+            return leaf;
+        } catch {
+            return null;
+        }
+    }
+
+    private async waitForCanvasNodes(leaf: WorkspaceLeaf, timeoutMs = 3000): Promise<{ nodes?: Map<string, unknown> } | null> {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const canvas = (leaf.view as unknown as { canvas?: { nodes?: Map<string, unknown> } }).canvas;
+                if (canvas?.nodes && canvas.nodes.size > 0) return canvas;
+            } catch {
+                // リトライ
+            }
+            await new Promise((r) => window.setTimeout(r, 100));
+        }
+        try {
+            const canvas = (leaf.view as unknown as { canvas?: { nodes?: Map<string, unknown> } }).canvas;
+            return canvas ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    private findCanvasNodesForFile(canvas: { nodes?: Map<string, unknown> }, file: TFile): unknown[] {
+        const out: unknown[] = [];
+        try {
+            const nodes = canvas.nodes;
+            if (!nodes || typeof nodes.values !== 'function') return out;
+            for (const n of nodes.values()) {
+                const node = n as { type?: unknown; url?: unknown; filePath?: unknown; file?: unknown };
+                if (!node) continue;
+                if (typeof node.url === 'string' && node.url) continue;
+                const fp = typeof node.filePath === 'string' ? node.filePath : null;
+                const nf = node.file as TFile | string | undefined;
+                const resolved = nf instanceof TFile ? nf.path : (typeof nf === 'string' ? nf : fp);
+                if (resolved === file.path) {
+                    out.push(node);
+                    continue;
+                }
+                // linkpath解決のフォールバック
+                if (fp) {
+                    try {
+                        const dest = this.app.metadataCache.getFirstLinkpathDest(fp, this.canvasSourcePath ?? '');
+                        if (dest instanceof TFile && dest.path === file.path) out.push(node);
+                    } catch {
+                        // ignore
+                    }
+                }
+            }
+        } catch {
+            // ignore
+        }
+        return out;
     }
 
     getCanvasFiles(): TFile[] {
@@ -1012,16 +1733,26 @@ class CanvasPickerModal extends FuzzySuggestModal<TFile> {
 
 export default class KeepPlugin extends Plugin {
     settings: NoteMasonrySettings = { ...DEFAULT_SETTINGS };
+    private canvasHeaderActions = new Map<WorkspaceLeaf, HTMLElement>();
+    private headerUpdateTimer: number | null = null;
 
     async onload() {
         await this.loadSettings();
-        this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
+        this.registerView(KEEP_VIEW_TYPE, (leaf) => {
+            const view = new KeepView(leaf);
+            view.scratchFolder = this.settings.scratchFolder;
+            return view;
+        });
         this.addRibbonIcon('layout-grid', 'Open note masonry', () => void this.activateView());
         this.addSettingTab(new NoteMasonrySettingTab(this.app, this));
         // Canvasコアは .canvas-node-label の click を Mod付きのときのみ開く
         // (素のクリックは何もしない)。素の左クリックだけを横取りして右分割で開く。
         // キャプチャ段階で拾うことで、コアや他プラグインのバブルハンドラより先に処理する。
         this.registerDomEvent(document, 'click', this.onCanvasLabelClickCapture, true);
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scheduleCanvasHeaderUpdate()));
+        this.registerEvent(this.app.workspace.on('layout-change', () => this.scheduleCanvasHeaderUpdate()));
+        this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleCanvasHeaderUpdate()));
+        this.app.workspace.onLayoutReady(() => this.updateCanvasHeaderButtons());
         this.updateBodyClass();
     }
 
@@ -1030,8 +1761,24 @@ export default class KeepPlugin extends Plugin {
     }
 
     async saveSettings() {
+        this.settings.scratchFolder = normalizeScratchFolder(this.settings.scratchFolder);
         await this.saveData(this.settings);
         this.updateBodyClass();
+        this.syncScratchFolderToViews();
+    }
+
+    /** 設定変更を既存の全KeepViewへ反映する */
+    private syncScratchFolderToViews() {
+        try {
+            for (const leaf of this.app.workspace.getLeavesOfType(KEEP_VIEW_TYPE)) {
+                const view = leaf.view as unknown as KeepView;
+                if (view instanceof KeepView) {
+                    view.scratchFolder = this.settings.scratchFolder;
+                }
+            }
+        } catch {
+            // ignore
+        }
     }
 
     private updateBodyClass() {
@@ -1040,6 +1787,68 @@ export default class KeepPlugin extends Plugin {
 
     onunload() {
         document.body.removeClass('note-masonry-canvas-label-split');
+        for (const el of this.canvasHeaderActions.values()) {
+            try { el.remove(); } catch { /* ignore */ }
+        }
+        this.canvasHeaderActions.clear();
+        if (this.headerUpdateTimer !== null) {
+            window.clearTimeout(this.headerUpdateTimer);
+            this.headerUpdateTimer = null;
+        }
+    }
+
+    private scheduleCanvasHeaderUpdate() {
+        if (this.headerUpdateTimer !== null) {
+            window.clearTimeout(this.headerUpdateTimer);
+        }
+        this.headerUpdateTimer = window.setTimeout(() => {
+            this.headerUpdateTimer = null;
+            this.updateCanvasHeaderButtons();
+        }, 150);
+    }
+
+    /**
+     * canvasビューのview-header（3点メニュー左）にCard View絞り込みボタンを注入する。
+     * header再描画で消えるため冪等な再付与＋不要分の除去を行う。
+     */
+    private updateCanvasHeaderButtons() {
+        try {
+            const canvasLeaves = this.app.workspace.getLeavesOfType('canvas');
+            const alive = new Set(canvasLeaves);
+            for (const [leaf, el] of Array.from(this.canvasHeaderActions.entries())) {
+                if (!alive.has(leaf)) {
+                    try { el.remove(); } catch { /* ignore */ }
+                    this.canvasHeaderActions.delete(leaf);
+                    continue;
+                }
+                // header再生成でDOMから外れた場合は再注入対象に戻す
+                if (!el.isConnected) {
+                    this.canvasHeaderActions.delete(leaf);
+                }
+            }
+            for (const leaf of canvasLeaves) {
+                if (this.canvasHeaderActions.has(leaf)) continue;
+                try {
+                    const view = leaf.view as unknown as ItemView & { file?: TFile };
+                    if (!view || typeof view.addAction !== 'function') continue;
+                    const canvasFile = view.file;
+                    if (!(canvasFile instanceof TFile) || canvasFile.extension !== 'canvas') continue;
+                    const el = view.addAction('layout-grid', 'このキャンバス内のファイルをCard Viewで表示', () => {
+                        const current = (leaf.view as unknown as { file?: TFile }).file;
+                        if (current instanceof TFile && current.extension === 'canvas') {
+                            void this.openCanvasFilteredView(current);
+                        }
+                    });
+                    el.addClass('note-masonry-canvas-filter-btn');
+                    el.setAttr('aria-label', 'このキャンバス内のファイルをCard Viewで表示');
+                    this.canvasHeaderActions.set(leaf, el);
+                } catch {
+                    // 1leafの失敗で全体を止めない
+                }
+            }
+        } catch {
+            // ignore
+        }
     }
 
     /**
@@ -1101,15 +1910,24 @@ export default class KeepPlugin extends Plugin {
     /**
      * 既存の右側リーフがあれば再利用し、なければ右にvertical分割を作って開く。
      * 同一ファイルを既に開いているリーフがあればそこを優先してペイン増殖を防ぐ。
+     * KeepView/canvas自体は再利用候補から除外する。
      */
     private async openInRightSplit(file: TFile, canvasLeaf?: WorkspaceLeaf): Promise<void> {
         const ws = this.app.workspace;
         const leaves: WorkspaceLeaf[] = [];
         ws.iterateRootLeaves((l) => leaves.push(l));
-        let target: WorkspaceLeaf | null = null;
-        if (leaves.length > 1) {
+        const candidates = leaves.filter((l) => {
             try {
-                const same = leaves.find((l) => {
+                const t = (l.view as unknown as { getViewType?: () => string }).getViewType?.();
+                return t !== KEEP_VIEW_TYPE && t !== 'canvas';
+            } catch {
+                return true;
+            }
+        });
+        let target: WorkspaceLeaf | null = null;
+        if (candidates.length > 0) {
+            try {
+                const same = candidates.find((l) => {
                     try {
                         return (l.view as unknown as { file?: TFile }).file?.path === file.path;
                     } catch {
@@ -1119,7 +1937,7 @@ export default class KeepPlugin extends Plugin {
                 if (same) {
                     target = same;
                 } else {
-                    target = leaves.find((l) => l !== canvasLeaf) ?? null;
+                    target = candidates.find((l) => l !== canvasLeaf) ?? null;
                 }
             } catch {
                 target = null;
@@ -1130,6 +1948,49 @@ export default class KeepPlugin extends Plugin {
         }
         await target.openFile(file);
         await ws.revealLeaf(target);
+    }
+
+    /**
+     * 指定canvasで絞り込んだCard Viewを右分割で開く。既存があれば再利用する。
+     */
+    async openCanvasFilteredView(canvasFile: TFile): Promise<void> {
+        const ws = this.app.workspace;
+        const keepLeaves = ws.getLeavesOfType(KEEP_VIEW_TYPE);
+        for (const leaf of keepLeaves) {
+            try {
+                const v = leaf.view as unknown as KeepView;
+                if (v instanceof KeepView && v.canvasSourcePath === canvasFile.path) {
+                    await ws.revealLeaf(leaf);
+                    v.requestRender();
+                    return;
+                }
+            } catch {
+                // 次を試す
+            }
+        }
+        const reusable = keepLeaves.find((leaf) => {
+            try {
+                return (leaf.view as unknown as KeepView).canvasSourcePath != null;
+            } catch {
+                return false;
+            }
+        });
+        if (reusable) {
+            await reusable.setViewState({
+                type: KEEP_VIEW_TYPE,
+                active: true,
+                state: { canvasSourcePath: canvasFile.path },
+            });
+            await ws.revealLeaf(reusable);
+            return;
+        }
+        const leaf = ws.getLeaf('split', 'vertical');
+        await leaf.setViewState({
+            type: KEEP_VIEW_TYPE,
+            active: true,
+            state: { canvasSourcePath: canvasFile.path },
+        });
+        await ws.revealLeaf(leaf);
     }
 
     async activateView() {
@@ -1158,6 +2019,16 @@ class NoteMasonrySettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.canvasLabelSplitEnabled)
                 .onChange(async (value) => {
                     this.plugin.settings.canvasLabelSplitEnabled = value;
+                    await this.plugin.saveSettings();
+                }));
+        new Setting(containerEl)
+            .setName('テキスト編集用スクラッチフォルダ')
+            .setDesc('キャンバス内のテキストカードを大モーダルで編集するための使い回しファイルの置き場所（Vault相対、canvasごとに1件・自動削除なし）。検索等に紛れないよう「設定→ファイルとリンク→除外ファイル」への登録を推奨します。')
+            .addText((text) => text
+                .setPlaceholder(DEFAULT_SCRATCH_FOLDER)
+                .setValue(this.plugin.settings.scratchFolder)
+                .onChange(async (value) => {
+                    this.plugin.settings.scratchFolder = normalizeScratchFolder(value);
                     await this.plugin.saveSettings();
                 }));
     }

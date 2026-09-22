@@ -32,11 +32,21 @@ var import_obsidian = require("obsidian");
 var KEEP_VIEW_TYPE = "keep-view";
 var DEFAULT_TAG_FILTER = "#WIP";
 var RANDOM_FILE_COUNT = 15;
+var DEFAULT_SCRATCH_FOLDER = "__masonry-scratch";
 var DEFAULT_SETTINGS = {
-  canvasLabelSplitEnabled: true
+  canvasLabelSplitEnabled: true,
+  scratchFolder: DEFAULT_SCRATCH_FOLDER
 };
+function normalizeScratchFolder(raw) {
+  const cleaned = (raw != null ? raw : "").replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
+  return cleaned || DEFAULT_SCRATCH_FOLDER;
+}
+function sanitizeFileName(raw) {
+  const cleaned = (raw != null ? raw : "").replace(/[\/\\:#|?*<>"]/g, "-").trim();
+  return cleaned || "untitled";
+}
 var NoteEditModal = class {
-  constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "") {
+  constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "", hideTitle = false) {
     this.editorLeaf = null;
     this.prevActiveEditor = null;
     this.hasSavedActiveEditor = false;
@@ -54,6 +64,7 @@ var NoteEditModal = class {
     this.onCloseCallback = onCloseCallback;
     this.selectedFolder = selectedFolder;
     this.selectedTag = selectedTag;
+    this.hideTitle = hideTitle;
     this.scope = new import_obsidian.Scope(this.app.scope);
     this.scope.register(null, "Escape", () => {
       this.close();
@@ -64,6 +75,8 @@ var NoteEditModal = class {
     this.bgEl = this.containerEl.createDiv({ cls: "modal-bg keep-modal-bg" });
     this.bgEl.addEventListener("click", () => this.close());
     this.modalEl = this.containerEl.createDiv({ cls: "modal keep-editor-modal" });
+    if (this.hideTitle)
+      this.modalEl.addClass("keep-hide-title");
     this.contentEl = this.modalEl.createDiv({ cls: "modal-content keep-editor-modal-content" });
   }
   open() {
@@ -256,14 +269,23 @@ var NoteEditModal = class {
 var KeepView = class extends import_obsidian.ItemView {
   constructor(leaf) {
     super(leaf);
+    this.filterContainer = null;
+    this.leftFilters = null;
+    this.createButton = null;
+    this.canvasBanner = null;
     this.isRendering = false;
     this.renderTimeout = null;
     this.hasAppliedDefaultTagFilter = false;
+    this.canvasFocusCycle = {};
+    /** テキスト編集用スクラッチの格納フォルダ（KeepPluginから注入される） */
+    this.scratchFolder = DEFAULT_SCRATCH_FOLDER;
+    this.activeTextSession = null;
     this.selectedFolder = "";
     this.selectedTag = "";
     this.searchQuery = "";
     this.isRandomMode = false;
     this.randomFiles = [];
+    this.canvasSourcePath = null;
   }
   getViewType() {
     return KEEP_VIEW_TYPE;
@@ -279,8 +301,12 @@ var KeepView = class extends import_obsidian.ItemView {
       ...super.getState(),
       selectedFolder: this.selectedFolder,
       selectedTag: this.selectedTag,
-      searchQuery: this.searchQuery
+      searchQuery: this.searchQuery,
+      canvasSourcePath: this.canvasSourcePath
     };
+  }
+  isCanvasMode() {
+    return !!this.canvasSourcePath;
   }
   async setState(state, result) {
     if (typeof state.selectedFolder === "string") {
@@ -293,9 +319,20 @@ var KeepView = class extends import_obsidian.ItemView {
     if (typeof state.searchQuery === "string") {
       this.searchQuery = state.searchQuery;
     }
+    if (typeof state.canvasSourcePath === "string" && state.canvasSourcePath) {
+      this.canvasSourcePath = state.canvasSourcePath;
+    } else if (state.canvasSourcePath === null || state.canvasSourcePath === "") {
+      this.canvasSourcePath = null;
+    }
     this.isRandomMode = false;
     this.randomFiles = [];
+    this.canvasFocusCycle = {};
     await super.setState(state, result);
+    this.updateCanvasModeUI();
+    if (this.searchInput && typeof this.searchQuery === "string") {
+      this.searchInput.value = this.searchQuery;
+      this.updateSearchVisibility();
+    }
     this.requestRender();
   }
   async onOpen() {
@@ -303,7 +340,9 @@ var KeepView = class extends import_obsidian.ItemView {
     container.empty();
     container.addClass("keep-view-container");
     const filterContainer = container.createEl("div", { cls: "keep-filter-container" });
+    this.filterContainer = filterContainer;
     const leftFilters = filterContainer.createEl("div", { cls: "keep-filter-left" });
+    this.leftFilters = leftFilters;
     this.folderSelect = leftFilters.createEl("select", { cls: "keep-select" });
     this.folderSelect.addEventListener("change", (e) => {
       this.selectedFolder = e.target.value;
@@ -354,17 +393,122 @@ var KeepView = class extends import_obsidian.ItemView {
     const createButton = filterContainer.createEl("button", {
       cls: "keep-create-button"
     });
+    this.createButton = createButton;
     (0, import_obsidian.setIcon)(createButton, "plus");
     createButton.addEventListener("click", () => {
       new NoteEditModal(this.app, null, this.leaf, () => this.requestRender(), this.selectedFolder, this.selectedTag).open();
     });
+    this.canvasBanner = container.createEl("div", { cls: "keep-canvas-banner" });
+    this.canvasBanner.hide();
     this.gridContainer = container.createEl("div", { cls: "keep-grid-wrapper" });
     this.registerEvent(this.app.vault.on("create", () => this.requestRender()));
     this.registerEvent(this.app.vault.on("modify", () => this.requestRender()));
     this.registerEvent(this.app.vault.on("delete", () => this.requestRender()));
     this.registerEvent(this.app.vault.on("rename", () => this.requestRender()));
     this.registerEvent(this.app.metadataCache.on("changed", () => this.requestRender()));
+    this.updateCanvasModeUI();
     await this.renderGrid();
+  }
+  /** canvasモードではフォルダ/タグ/ランダム/新規作成を隠し、検索バーのみ＋バナーを表示する */
+  updateCanvasModeUI() {
+    const canvasMode = this.isCanvasMode();
+    if (this.leftFilters) {
+      this.leftFilters.style.display = canvasMode ? "none" : "";
+    }
+    if (this.randomButton) {
+      this.randomButton.style.display = canvasMode ? "none" : "";
+    }
+    if (this.createButton) {
+      this.createButton.style.display = canvasMode ? "none" : "";
+    }
+    if (this.canvasBanner) {
+      this.canvasBanner.empty();
+      if (canvasMode && this.canvasSourcePath) {
+        this.canvasBanner.show();
+        const label = this.canvasBanner.createEl("span", {
+          cls: "keep-canvas-banner-label",
+          text: `Filtered by ${this.canvasSourcePath}`
+        });
+        label.setAttr("title", this.canvasSourcePath);
+        const clearBtn = this.canvasBanner.createEl("button", {
+          cls: "keep-canvas-banner-clear",
+          attr: { "aria-label": "Clear canvas filter" }
+        });
+        (0, import_obsidian.setIcon)(clearBtn, "x");
+        clearBtn.addEventListener("click", () => {
+          this.canvasSourcePath = null;
+          this.canvasFocusCycle = {};
+          this.updateCanvasModeUI();
+          this.requestRender();
+        });
+      } else {
+        this.canvasBanner.hide();
+      }
+    }
+  }
+  getCanvasSourceFile() {
+    if (!this.canvasSourcePath)
+      return null;
+    const f = this.app.vault.getAbstractFileByPath(this.canvasSourcePath);
+    return f instanceof import_obsidian.TFile ? f : null;
+  }
+  /** .canvas JSONからfile/textノードを取り出す（link/groupは除外）。配置順維持のためnodeIndexを付与する */
+  async loadCanvasGridItems(canvasFile) {
+    let raw = "";
+    try {
+      raw = await this.app.vault.read(canvasFile);
+    } catch (e) {
+      return [];
+    }
+    try {
+      const data = JSON.parse(raw);
+      if (!data || !Array.isArray(data.nodes))
+        return [];
+      const fileSeen = /* @__PURE__ */ new Set();
+      const fileByKey = /* @__PURE__ */ new Map();
+      const texts = [];
+      data.nodes.forEach((n, index) => {
+        const node = n;
+        if (!node || typeof node.type !== "string")
+          return;
+        if (node.type === "file" && typeof node.file === "string" && node.file) {
+          let f = this.app.vault.getAbstractFileByPath(node.file);
+          if (!(f instanceof import_obsidian.TFile)) {
+            try {
+              const dest = this.app.metadataCache.getFirstLinkpathDest(node.file, canvasFile.path);
+              if (dest instanceof import_obsidian.TFile)
+                f = dest;
+            } catch (e) {
+            }
+          }
+          if (f instanceof import_obsidian.TFile && !fileSeen.has(f.path)) {
+            fileSeen.add(f.path);
+            fileByKey.set(f.path, { file: f, nodeIndex: index });
+          }
+        } else if (node.type === "text" && typeof node.id === "string" && typeof node.text === "string") {
+          texts.push({
+            kind: "text",
+            nodeId: node.id,
+            text: node.text,
+            color: typeof node.color === "string" ? node.color : void 0,
+            nodeIndex: index
+          });
+        }
+      });
+      const items = [];
+      for (const { file, nodeIndex } of fileByKey.values()) {
+        items.push({ kind: "file", file, nodeIndex });
+      }
+      for (const t of texts)
+        items.push(t);
+      items.sort((a, b) => a.nodeIndex - b.nodeIndex);
+      return items;
+    } catch (e) {
+      return [];
+    }
+  }
+  isMarkdownFile(file) {
+    return file.extension === "md";
   }
   updateSearchVisibility() {
     const searchWrapper = this.containerEl.querySelector(".keep-search-wrapper");
@@ -403,7 +547,7 @@ var KeepView = class extends import_obsidian.ItemView {
     this.hasAppliedDefaultTagFilter = true;
   }
   showRandomFiles() {
-    const all = this.app.vault.getMarkdownFiles();
+    const all = this.app.vault.getMarkdownFiles().filter((f) => !this.isScratchFile(f));
     for (let i = all.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [all[i], all[j]] = [all[j], all[i]];
@@ -481,15 +625,20 @@ var KeepView = class extends import_obsidian.ItemView {
       return;
     this.isRendering = true;
     try {
+      this.updateCanvasModeUI();
+      if (this.isCanvasMode()) {
+        await this.renderCanvasGrid();
+        return;
+      }
       this.applyDefaultTagFilter();
       this.updateFilterUI();
       this.updateRandomButtonState();
       let files;
       if (this.isRandomMode) {
         const existingPaths = new Set(this.app.vault.getMarkdownFiles().map((f) => f.path));
-        files = this.randomFiles.filter((f) => existingPaths.has(f.path));
+        files = this.randomFiles.filter((f) => existingPaths.has(f.path) && !this.isScratchFile(f));
       } else {
-        let filtered = this.app.vault.getMarkdownFiles();
+        let filtered = this.app.vault.getMarkdownFiles().filter((f) => !this.isScratchFile(f));
         if (this.selectedFolder) {
           filtered = filtered.filter((f) => {
             var _a2, _b;
@@ -550,25 +699,384 @@ var KeepView = class extends import_obsidian.ItemView {
       this.isRendering = false;
     }
   }
+  /** canvasモード専用: そのcanvas内のfile/textノードを配置順で表示し、検索バーで絞り込む */
+  async renderCanvasGrid() {
+    this.gridContainer.empty();
+    const canvasFile = this.getCanvasSourceFile();
+    if (!canvasFile || canvasFile.extension !== "canvas") {
+      this.gridContainer.createEl("div", {
+        text: this.canvasSourcePath ? `Canvas not found: ${this.canvasSourcePath}` : "No canvas selected.",
+        cls: "keep-empty-message"
+      });
+      return;
+    }
+    let items = await this.loadCanvasGridItems(canvasFile);
+    if (this.searchQuery) {
+      const query = this.searchQuery.toLowerCase();
+      const results = await Promise.all(items.map((item) => {
+        if (item.kind === "file")
+          return this.matchesCanvasSearch(item.file, query);
+        return Promise.resolve(item.text.toLowerCase().includes(query));
+      }));
+      items = items.filter((_, i) => results[i]);
+    }
+    if (items.length === 0) {
+      this.gridContainer.createEl("div", {
+        text: "\u3053\u306E\u30AD\u30E3\u30F3\u30D0\u30B9\u306B\u8868\u793A\u3067\u304D\u308B\u30D5\u30A1\u30A4\u30EB\u304C\u3042\u308A\u307E\u305B\u3093\u3002",
+        cls: "keep-empty-message"
+      });
+      return;
+    }
+    const grid = this.gridContainer.createEl("div", { cls: "keep-grid" });
+    await this.renderCanvasCards(items, grid);
+  }
+  async matchesCanvasSearch(file, query) {
+    if (file.basename.toLowerCase().includes(query))
+      return true;
+    if (file.path.toLowerCase().includes(query))
+      return true;
+    if (!this.isMarkdownFile(file))
+      return false;
+    try {
+      const content = await this.app.vault.cachedRead(file);
+      const cache = this.app.metadataCache.getFileCache(file);
+      let body = content;
+      if (cache == null ? void 0 : cache.frontmatterPosition) {
+        body = content.substring(cache.frontmatterPosition.end.offset);
+      } else {
+        body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+      }
+      return body.toLowerCase().includes(query);
+    } catch (e) {
+      return false;
+    }
+  }
+  /** canvasモード専用の混在グリッド描画（配置順）。fileは既存カード、textはタイトルなし＋その場編集 */
+  async renderCanvasCards(items, container) {
+    const filesOnly = items.every((i) => i.kind === "file");
+    if (filesOnly) {
+      await this.renderCards(items.map((i) => i.file), container);
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    for (const item of items) {
+      if (item.kind === "file") {
+        await this.buildCanvasFileCard(item.file, fragment);
+      } else {
+        this.buildCanvasTextCard(item, fragment);
+      }
+    }
+    container.appendChild(fragment);
+  }
+  /** canvasモードのファイルカード1件分（renderCardsのcanvas分岐と同等。split残存／pin・menu・DnDなし） */
+  async buildCanvasFileCard(file, fragment) {
+    const isMd = this.isMarkdownFile(file);
+    let contentWithoutFrontmatter = "";
+    if (isMd) {
+      try {
+        const content = await this.app.vault.cachedRead(file);
+        const cache = this.app.metadataCache.getFileCache(file);
+        if (cache == null ? void 0 : cache.frontmatterPosition) {
+          contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
+        } else {
+          contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
+        }
+      } catch (e) {
+        contentWithoutFrontmatter = "";
+      }
+    }
+    const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
+    const images = [];
+    let match;
+    if (isMd) {
+      while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
+        const url = match[1] || match[2];
+        if (url)
+          images.push(url);
+      }
+    }
+    const resolvedImages = images.map((img) => {
+      if (img.startsWith("http://") || img.startsWith("https://") || img.startsWith("app://") || img.startsWith("data:")) {
+        return img;
+      }
+      const linkedFile = this.app.metadataCache.getFirstLinkpathDest(img, file.path);
+      if (linkedFile)
+        return this.app.vault.getResourcePath(linkedFile);
+      return null;
+    }).filter((img) => img !== null);
+    if (!isMd && this.isImageFile(file)) {
+      try {
+        resolvedImages.unshift(this.app.vault.getResourcePath(file));
+      } catch (e) {
+      }
+    }
+    const snippetText = isMd ? contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, "").trim() : `${file.extension.toUpperCase()} \u2022 ${file.path}`;
+    const snippet = isMd ? snippetText.substring(0, 250) + (snippetText.length > 250 ? "..." : "") : snippetText;
+    const card = fragment.createEl("div", { cls: "keep-card" });
+    card.draggable = false;
+    if (resolvedImages.length > 0) {
+      const imgContainer = card.createEl("div", { cls: `keep-card-images keep-card-images-${Math.min(resolvedImages.length, 2)}` });
+      resolvedImages.slice(0, 2).forEach((img) => {
+        const imgEl = imgContainer.createEl("img", { attr: { src: img } });
+        imgEl.draggable = false;
+      });
+    }
+    const splitBtn = card.createEl("button", {
+      cls: "keep-split-btn",
+      attr: { "aria-label": "Open in split view" }
+    });
+    (0, import_obsidian.setIcon)(splitBtn, "panel-right");
+    const splitSvg = splitBtn.querySelector("svg");
+    if (splitSvg) {
+      splitSvg.setAttribute("fill", "none");
+      splitSvg.setAttribute("stroke", "currentColor");
+    }
+    splitBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const leaf = this.app.workspace.getLeaf("split");
+      void leaf.openFile(file);
+    });
+    if (file.basename) {
+      card.createEl("h3", { text: file.basename, cls: "keep-card-title" });
+    }
+    if (snippet) {
+      card.createEl("div", { text: snippet, cls: "keep-card-snippet" });
+    }
+    card.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        void this.focusCanvasNode(file);
+        return;
+      }
+      if (isMd) {
+        new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+      } else {
+        const leaf = this.app.workspace.getLeaf("tab");
+        void leaf.openFile(file);
+      }
+    });
+  }
+  /** テキストカード1件分。タイトルなし・全文スニペットのみ。通常クリックで大モーダル編集、Cmd+クリックでフォーカス */
+  buildCanvasTextCard(item, fragment) {
+    const card = fragment.createEl("div", { cls: "keep-card keep-text-card" });
+    card.draggable = false;
+    card.setAttr("data-canvas-node-id", item.nodeId);
+    const body = item.text.trim();
+    const snippet = body.length > 250 ? body.substring(0, 250) + "..." : body;
+    card.createEl("div", {
+      text: snippet || "(\u7A7A\u306E\u30C6\u30AD\u30B9\u30C8\u30AB\u30FC\u30C9)",
+      cls: "keep-card-snippet keep-text-snippet"
+    });
+    card.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        void this.focusCanvasNodeById(item.nodeId);
+        return;
+      }
+      void this.openCanvasTextModal(item);
+    });
+  }
+  getScratchFolder() {
+    return normalizeScratchFolder(this.scratchFolder);
+  }
+  isScratchFile(f) {
+    const folder = this.getScratchFolder();
+    return folder ? f.path === folder || f.path.startsWith(folder + "/") : false;
+  }
+  async ensureScratchFolder(folder) {
+    if (!folder)
+      return;
+    const existing = this.app.vault.getAbstractFileByPath(folder);
+    if (existing) {
+      if (existing instanceof import_obsidian.TFolder)
+        return;
+      throw new Error(`Scratch folder path is occupied by a file: ${folder}`);
+    }
+    await this.app.vault.createFolder(folder);
+  }
+  /**
+   * canvasごとの使い回しスクラッチファイルを取得する。なければ作成する。
+   * 毎回の作成・削除は行わない。
+   */
+  async getScratchFile(canvasFile) {
+    const folder = this.getScratchFolder();
+    await this.ensureScratchFolder(folder);
+    const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
+    const path = folder ? `${folder}/${name}` : name;
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof import_obsidian.TFile)
+      return existing;
+    if (existing) {
+      throw new Error(`Scratch file path is occupied: ${path}`);
+    }
+    return await this.app.vault.create(path, "");
+  }
+  /**
+   * テキストノードを通常ファイルと同じ大モーダルで編集する。
+   * スクラッチに本文を流し込んでNoteEditModalで開き、close時にcanvasへ書き戻す。
+   */
+  async openCanvasTextModal(item) {
+    try {
+      const canvasFile = this.getCanvasSourceFile();
+      if (!canvasFile) {
+        new import_obsidian.Notice("Canvas\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093");
+        return;
+      }
+      await this.flushActiveTextSession();
+      const scratch = await this.getScratchFile(canvasFile);
+      let current = "";
+      try {
+        current = await this.app.vault.read(scratch);
+      } catch (e) {
+        current = "";
+      }
+      if (current !== item.text) {
+        await this.app.vault.modify(scratch, item.text);
+      }
+      const baseText = item.text;
+      this.activeTextSession = { canvasPath: canvasFile.path, nodeId: item.nodeId, baseText };
+      new NoteEditModal(this.app, scratch, this.leaf, () => {
+        void this.onTextModalClose(canvasFile, item.nodeId, baseText);
+      }, "", "", true).open();
+    } catch (e) {
+      console.error("Open canvas text modal failed", e);
+      new import_obsidian.Notice("\u30C6\u30AD\u30B9\u30C8\u306E\u7DE8\u96C6\u3092\u958B\u3051\u307E\u305B\u3093\u3067\u3057\u305F");
+    }
+  }
+  /** モーダルclose時の書き戻し。エディタの自動保存を待ってからスクラッチ→canvasへ反映する */
+  async onTextModalClose(canvasFile, nodeId, baseText) {
+    var _a;
+    try {
+      await new Promise((r) => window.setTimeout(r, 300));
+      const folder = this.getScratchFolder();
+      const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
+      const scratchPath = folder ? `${folder}/${name}` : name;
+      const scratch = this.app.vault.getAbstractFileByPath(scratchPath);
+      if (scratch instanceof import_obsidian.TFile) {
+        let scratchText = "";
+        try {
+          scratchText = await this.app.vault.read(scratch);
+        } catch (e) {
+          scratchText = "";
+        }
+        await this.writeScratchBackToNode(canvasFile, nodeId, baseText, scratchText);
+      }
+    } catch (e) {
+      console.error("Save canvas text from modal failed", e);
+      new import_obsidian.Notice("\u30C6\u30AD\u30B9\u30C8\u30AB\u30FC\u30C9\u306E\u66F4\u65B0\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+    } finally {
+      if (((_a = this.activeTextSession) == null ? void 0 : _a.nodeId) === nodeId) {
+        this.activeTextSession = null;
+      }
+      this.requestRender();
+    }
+  }
+  /** スクラッチ内容をcanvasノードへ書き戻す。canvas側でも変わっていれば上書き＋通知する */
+  async writeScratchBackToNode(canvasFile, nodeId, baseText, scratchText) {
+    const raw = await this.app.vault.read(canvasFile);
+    const data = JSON.parse(raw);
+    if (!data || !Array.isArray(data.nodes))
+      return false;
+    const node = data.nodes.find((n) => n && n.id === nodeId && n.type === "text");
+    if (!node || typeof node.text !== "string")
+      return false;
+    if (node.text === scratchText)
+      return true;
+    if (node.text !== baseText) {
+      new import_obsidian.Notice("Canvas\u5074\u3067\u3082\u5909\u66F4\u304C\u3042\u308A\u307E\u3057\u305F\u3002\u4E0A\u66F8\u304D\u3057\u307E\u3057\u305F");
+    }
+    node.text = scratchText;
+    await this.app.vault.modify(canvasFile, JSON.stringify(data, null, 2));
+    return true;
+  }
+  /** 残存セッションがあれば書き戻す（モーダル排他のため通常は空のはずだが安全のため） */
+  async flushActiveTextSession() {
+    const session = this.activeTextSession;
+    if (!session)
+      return;
+    try {
+      const canvasFile = this.app.vault.getAbstractFileByPath(session.canvasPath);
+      if (!(canvasFile instanceof import_obsidian.TFile)) {
+        this.activeTextSession = null;
+        return;
+      }
+      const folder = this.getScratchFolder();
+      const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
+      const scratch = this.app.vault.getAbstractFileByPath(folder ? `${folder}/${name}` : name);
+      if (scratch instanceof import_obsidian.TFile) {
+        const scratchText = await this.app.vault.read(scratch);
+        await this.writeScratchBackToNode(canvasFile, session.nodeId, session.baseText, scratchText);
+      }
+    } catch (e) {
+      console.error("Flush text session failed", e);
+    } finally {
+      this.activeTextSession = null;
+    }
+  }
+  /** ノードID指定でキャンバス上のテキストカードへフォーカスする（単一ノード想定） */
+  async focusCanvasNodeById(nodeId) {
+    try {
+      const canvasPath = this.canvasSourcePath;
+      if (!canvasPath)
+        return;
+      const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (!(canvasFile instanceof import_obsidian.TFile)) {
+        new import_obsidian.Notice(`Canvas not found: ${canvasPath}`);
+        return;
+      }
+      const leaf = await this.ensureCanvasLeafOpen(canvasFile);
+      if (!leaf) {
+        new import_obsidian.Notice("Canvas\u3092\u958B\u3051\u307E\u305B\u3093\u3067\u3057\u305F");
+        return;
+      }
+      const canvas = await this.waitForCanvasNodes(leaf);
+      if (!(canvas == null ? void 0 : canvas.nodes)) {
+        new import_obsidian.Notice("Canvas\u306E\u8AAD\u307F\u8FBC\u307F\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+        return;
+      }
+      const node = canvas.nodes.get(nodeId);
+      if (!node) {
+        new import_obsidian.Notice("Canvas\u4E0A\u306B\u898B\u3064\u304B\u308A\u307E\u305B\u3093\uFF08\u672A\u4FDD\u5B58\u306E\u53EF\u80FD\u6027\u304C\u3042\u308A\u307E\u3059\uFF09");
+        return;
+      }
+      this.applyCanvasFocus(canvas, node);
+    } catch (e) {
+      console.error("Focus canvas node failed", e);
+      new import_obsidian.Notice("Canvas\u3078\u306E\u30D5\u30A9\u30FC\u30AB\u30B9\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+    }
+  }
   async renderCards(files, container) {
     var _a;
     const fragment = document.createDocumentFragment();
+    const canvasMode = this.isCanvasMode();
     for (const file of files) {
-      const content = await this.app.vault.cachedRead(file);
-      const cache = this.app.metadataCache.getFileCache(file);
-      let contentWithoutFrontmatter = content;
-      if (cache == null ? void 0 : cache.frontmatterPosition) {
-        contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
-      } else {
-        contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
+      const isMd = this.isMarkdownFile(file);
+      let contentWithoutFrontmatter = "";
+      let cache = null;
+      if (isMd) {
+        try {
+          const content = await this.app.vault.cachedRead(file);
+          cache = this.app.metadataCache.getFileCache(file);
+          if (cache == null ? void 0 : cache.frontmatterPosition) {
+            contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
+          } else {
+            contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
+          }
+        } catch (e) {
+          contentWithoutFrontmatter = "";
+        }
       }
       const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
       const images = [];
       let match;
-      while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
-        const url = match[1] || match[2];
-        if (url) {
-          images.push(url);
+      if (isMd) {
+        while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
+          const url = match[1] || match[2];
+          if (url) {
+            images.push(url);
+          }
         }
       }
       const resolvedImages = images.map((img) => {
@@ -581,41 +1089,49 @@ var KeepView = class extends import_obsidian.ItemView {
         }
         return null;
       }).filter((img) => img !== null);
-      const snippetText = contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, "").trim();
-      const snippet = snippetText.substring(0, 250) + (snippetText.length > 250 ? "..." : "");
-      const card = fragment.createEl("div", { cls: "keep-card" });
-      card.draggable = true;
-      let cardWasDragged = false;
-      card.addEventListener("dragstart", (e) => {
-        cardWasDragged = true;
-        card.addClass("is-dragging");
+      if (!isMd && this.isImageFile(file)) {
         try {
-          const dm = this.app.dragManager;
-          if ((dm == null ? void 0 : dm.dragFile) && (dm == null ? void 0 : dm.onDragStart)) {
-            const info = dm.dragFile(e, file);
-            if (info)
-              dm.onDragStart(e, info);
-          } else if (dm == null ? void 0 : dm.dragFile) {
-            dm.dragFile(e, file);
-          } else if (e.dataTransfer) {
-            e.dataTransfer.effectAllowed = "copy";
-            try {
-              e.dataTransfer.setData("text/plain", file.path);
-            } catch (e2) {
-            }
-          }
-        } catch (e2) {
+          resolvedImages.unshift(this.app.vault.getResourcePath(file));
+        } catch (e) {
         }
-      });
-      card.addEventListener("dragend", () => {
-        card.removeClass("is-dragging");
-        window.setTimeout(() => {
-          cardWasDragged = false;
-        }, 150);
-      });
+      }
+      const snippetText = isMd ? contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, "").trim() : `${file.extension.toUpperCase()} \u2022 ${file.path}`;
+      const snippet = isMd ? snippetText.substring(0, 250) + (snippetText.length > 250 ? "..." : "") : snippetText;
+      const card = fragment.createEl("div", { cls: "keep-card" });
+      card.draggable = !canvasMode;
+      let cardWasDragged = false;
+      if (!canvasMode) {
+        card.addEventListener("dragstart", (e) => {
+          cardWasDragged = true;
+          card.addClass("is-dragging");
+          try {
+            const dm = this.app.dragManager;
+            if ((dm == null ? void 0 : dm.dragFile) && (dm == null ? void 0 : dm.onDragStart)) {
+              const info = dm.dragFile(e, file);
+              if (info)
+                dm.onDragStart(e, info);
+            } else if (dm == null ? void 0 : dm.dragFile) {
+              dm.dragFile(e, file);
+            } else if (e.dataTransfer) {
+              e.dataTransfer.effectAllowed = "copy";
+              try {
+                e.dataTransfer.setData("text/plain", file.path);
+              } catch (e2) {
+              }
+            }
+          } catch (e2) {
+          }
+        });
+        card.addEventListener("dragend", () => {
+          card.removeClass("is-dragging");
+          window.setTimeout(() => {
+            cardWasDragged = false;
+          }, 150);
+        });
+      }
       if (resolvedImages.length > 0) {
-        const imgContainer = card.createEl("div", { cls: `keep-card-images keep-card-images-${resolvedImages.length}` });
-        resolvedImages.forEach((img) => {
+        const imgContainer = card.createEl("div", { cls: `keep-card-images keep-card-images-${Math.min(resolvedImages.length, 2)}` });
+        resolvedImages.slice(0, 2).forEach((img) => {
           const imgEl = imgContainer.createEl("img", { attr: { src: img } });
           imgEl.draggable = false;
         });
@@ -635,83 +1151,243 @@ var KeepView = class extends import_obsidian.ItemView {
         const leaf = this.app.workspace.getLeaf("split");
         void leaf.openFile(file);
       });
-      const pinBtn = card.createEl("button", { cls: "keep-pin-btn" });
-      (0, import_obsidian.setIcon)(pinBtn, "pin");
-      const svg = pinBtn.querySelector("svg");
-      if (svg) {
-        svg.setAttribute("fill", "none");
-        svg.setAttribute("stroke", "currentColor");
-      }
-      const isPinned = ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.pinned) === true;
-      if (isPinned) {
-        pinBtn.addClass("is-pinned");
+      if (!canvasMode) {
+        const pinBtn = card.createEl("button", { cls: "keep-pin-btn" });
+        (0, import_obsidian.setIcon)(pinBtn, "pin");
+        const svg = pinBtn.querySelector("svg");
         if (svg) {
-          svg.setAttribute("fill", "currentColor");
+          svg.setAttribute("fill", "none");
+          svg.setAttribute("stroke", "currentColor");
         }
-      }
-      pinBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void this.app.fileManager.processFrontMatter(file, (fm) => {
-          fm.pinned = !isPinned;
-        });
-      });
-      const menuBtn = card.createEl("button", {
-        cls: "keep-menu-btn",
-        attr: { "aria-label": "Card menu" }
-      });
-      (0, import_obsidian.setIcon)(menuBtn, "more-horizontal");
-      const menuSvg = menuBtn.querySelector("svg");
-      if (menuSvg) {
-        menuSvg.setAttribute("fill", "none");
-        menuSvg.setAttribute("stroke", "currentColor");
-      }
-      menuBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const menu = new import_obsidian.Menu();
-        menu.addItem((item) => {
-          item.setTitle("Delete").setIcon("trash").onClick(() => {
-            void this.app.fileManager.trashFile(file).then(() => {
-              this.requestRender();
-            });
+        const isPinned = ((_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.pinned) === true;
+        if (isPinned) {
+          pinBtn.addClass("is-pinned");
+          if (svg) {
+            svg.setAttribute("fill", "currentColor");
+          }
+        }
+        pinBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          void this.app.fileManager.processFrontMatter(file, (fm) => {
+            fm.pinned = !isPinned;
           });
         });
-        menu.showAtMouseEvent(e);
-      });
+        const menuBtn = card.createEl("button", {
+          cls: "keep-menu-btn",
+          attr: { "aria-label": "Card menu" }
+        });
+        (0, import_obsidian.setIcon)(menuBtn, "more-horizontal");
+        const menuSvg = menuBtn.querySelector("svg");
+        if (menuSvg) {
+          menuSvg.setAttribute("fill", "none");
+          menuSvg.setAttribute("stroke", "currentColor");
+        }
+        menuBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const menu = new import_obsidian.Menu();
+          menu.addItem((item) => {
+            item.setTitle("Delete").setIcon("trash").onClick(() => {
+              void this.app.fileManager.trashFile(file).then(() => {
+                this.requestRender();
+              });
+            });
+          });
+          menu.showAtMouseEvent(e);
+        });
+      }
       if (file.basename) {
         card.createEl("h3", { text: file.basename, cls: "keep-card-title" });
       }
       if (snippet) {
         card.createEl("div", { text: snippet, cls: "keep-card-snippet" });
       }
-      card.addEventListener("click", () => {
+      card.addEventListener("click", (e) => {
         if (cardWasDragged) {
           cardWasDragged = false;
           return;
         }
-        new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+        if (canvasMode && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          e.stopPropagation();
+          void this.focusCanvasNode(file);
+          return;
+        }
+        if (isMd) {
+          new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+        } else {
+          const leaf = this.app.workspace.getLeaf("tab");
+          void leaf.openFile(file);
+        }
       });
-      card.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const menu = new import_obsidian.Menu();
-        menu.addItem((item) => {
-          item.setTitle("Send to Canvas").setIcon("layout-dashboard").onClick(() => void this.sendFileToCanvas(file));
-        });
-        menu.addItem((item) => {
-          item.setTitle("Send to new Canvas").setIcon("plus").onClick(() => void this.createCanvasAndAdd(file));
-        });
-        menu.addSeparator();
-        menu.addItem((item) => {
-          item.setTitle("Delete").setIcon("trash").onClick(() => {
-            void this.app.fileManager.trashFile(file).then(() => {
-              this.requestRender();
+      if (!canvasMode) {
+        card.addEventListener("contextmenu", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const menu = new import_obsidian.Menu();
+          menu.addItem((item) => {
+            item.setTitle("Send to Canvas").setIcon("layout-dashboard").onClick(() => void this.sendFileToCanvas(file));
+          });
+          menu.addItem((item) => {
+            item.setTitle("Send to new Canvas").setIcon("plus").onClick(() => void this.createCanvasAndAdd(file));
+          });
+          menu.addSeparator();
+          menu.addItem((item) => {
+            item.setTitle("Delete").setIcon("trash").onClick(() => {
+              void this.app.fileManager.trashFile(file).then(() => {
+                this.requestRender();
+              });
             });
           });
+          menu.showAtMouseEvent(e);
         });
-        menu.showAtMouseEvent(e);
-      });
+      }
     }
     container.appendChild(fragment);
+  }
+  isImageFile(file) {
+    return ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"].includes(file.extension.toLowerCase());
+  }
+  /**
+   * Cmd/Ctrl+クリックでキャンバス上の該当ノードへフォーカスする。
+   * 同一ファイルの複数ノードは1件ずつサイクルし、canvasが閉じていれば開き直す。
+   */
+  async focusCanvasNode(file) {
+    var _a;
+    try {
+      const canvasPath = this.canvasSourcePath;
+      if (!canvasPath)
+        return;
+      const canvasFile = this.app.vault.getAbstractFileByPath(canvasPath);
+      if (!(canvasFile instanceof import_obsidian.TFile)) {
+        new import_obsidian.Notice(`Canvas not found: ${canvasPath}`);
+        return;
+      }
+      const leaf = await this.ensureCanvasLeafOpen(canvasFile);
+      if (!leaf) {
+        new import_obsidian.Notice("Canvas\u3092\u958B\u3051\u307E\u305B\u3093\u3067\u3057\u305F");
+        return;
+      }
+      const canvas = await this.waitForCanvasNodes(leaf);
+      if (!canvas) {
+        new import_obsidian.Notice("Canvas\u306E\u8AAD\u307F\u8FBC\u307F\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+        return;
+      }
+      const matches = this.findCanvasNodesForFile(canvas, file);
+      if (matches.length === 0) {
+        new import_obsidian.Notice("Canvas\u4E0A\u306B\u898B\u3064\u304B\u308A\u307E\u305B\u3093\uFF08\u672A\u4FDD\u5B58\u306E\u53EF\u80FD\u6027\u304C\u3042\u308A\u307E\u3059\uFF09");
+        return;
+      }
+      const prev = (_a = this.canvasFocusCycle[file.path]) != null ? _a : -1;
+      const next = (prev + 1) % matches.length;
+      this.canvasFocusCycle[file.path] = next;
+      const node = matches[next];
+      this.applyCanvasFocus(canvas, node);
+    } catch (e) {
+      console.error("Focus canvas node failed", e);
+      new import_obsidian.Notice("Canvas\u3078\u306E\u30D5\u30A9\u30FC\u30AB\u30B9\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+    }
+  }
+  applyCanvasFocus(canvas, node) {
+    const c = canvas;
+    const n = node;
+    try {
+      if (typeof c.deselectAll === "function")
+        c.deselectAll();
+      if (typeof c.selectOnly === "function")
+        c.selectOnly(node);
+      else if (typeof c.select === "function")
+        c.select(node);
+      if (typeof n.focus === "function") {
+        try {
+          n.focus();
+        } catch (e) {
+        }
+      }
+      if (typeof c.zoomToSelection === "function") {
+        c.zoomToSelection();
+      } else if (typeof c.zoomToBbox === "function") {
+        if (typeof n.x === "number" && typeof n.y === "number") {
+          const w = typeof n.width === "number" ? n.width : 400;
+          const h = typeof n.height === "number" ? n.height : 300;
+          c.zoomToBbox({ minX: n.x - w * 0.5, minY: n.y - h * 0.5, maxX: n.x + w * 1.5, maxY: n.y + h * 1.5 });
+        }
+      }
+    } catch (e) {
+      console.error("Focus canvas node failed", e);
+      new import_obsidian.Notice("Canvas\u3078\u306E\u30D5\u30A9\u30FC\u30AB\u30B9\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+    }
+  }
+  async ensureCanvasLeafOpen(canvasFile) {
+    try {
+      const leaves = this.app.workspace.getLeavesOfType("canvas");
+      for (const leaf2 of leaves) {
+        try {
+          const f = leaf2.view.file;
+          if ((f == null ? void 0 : f.path) === canvasFile.path) {
+            await this.app.workspace.revealLeaf(leaf2);
+            return leaf2;
+          }
+        } catch (e) {
+        }
+      }
+      const leaf = this.app.workspace.getLeaf("tab");
+      await leaf.openFile(canvasFile);
+      await this.app.workspace.revealLeaf(leaf);
+      return leaf;
+    } catch (e) {
+      return null;
+    }
+  }
+  async waitForCanvasNodes(leaf, timeoutMs = 3e3) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const canvas = leaf.view.canvas;
+        if ((canvas == null ? void 0 : canvas.nodes) && canvas.nodes.size > 0)
+          return canvas;
+      } catch (e) {
+      }
+      await new Promise((r) => window.setTimeout(r, 100));
+    }
+    try {
+      const canvas = leaf.view.canvas;
+      return canvas != null ? canvas : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  findCanvasNodesForFile(canvas, file) {
+    var _a;
+    const out = [];
+    try {
+      const nodes = canvas.nodes;
+      if (!nodes || typeof nodes.values !== "function")
+        return out;
+      for (const n of nodes.values()) {
+        const node = n;
+        if (!node)
+          continue;
+        if (typeof node.url === "string" && node.url)
+          continue;
+        const fp = typeof node.filePath === "string" ? node.filePath : null;
+        const nf = node.file;
+        const resolved = nf instanceof import_obsidian.TFile ? nf.path : typeof nf === "string" ? nf : fp;
+        if (resolved === file.path) {
+          out.push(node);
+          continue;
+        }
+        if (fp) {
+          try {
+            const dest = this.app.metadataCache.getFirstLinkpathDest(fp, (_a = this.canvasSourcePath) != null ? _a : "");
+            if (dest instanceof import_obsidian.TFile && dest.path === file.path)
+              out.push(node);
+          } catch (e) {
+          }
+        }
+      }
+    } catch (e) {
+    }
+    return out;
   }
   getCanvasFiles() {
     return this.app.vault.getFiles().filter((f) => f.extension === "canvas");
@@ -896,6 +1572,8 @@ var KeepPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.settings = { ...DEFAULT_SETTINGS };
+    this.canvasHeaderActions = /* @__PURE__ */ new Map();
+    this.headerUpdateTimer = null;
     /**
      * Canvasカード左上のファイル名ラベル(.canvas-node-label)の素の左クリックを、
      * 右側の分割ペインで開く動作に変える。修飾キー付き・中クリックはコアに任せる。
@@ -960,38 +1638,136 @@ var KeepPlugin = class extends import_obsidian.Plugin {
   }
   async onload() {
     await this.loadSettings();
-    this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
+    this.registerView(KEEP_VIEW_TYPE, (leaf) => {
+      const view = new KeepView(leaf);
+      view.scratchFolder = this.settings.scratchFolder;
+      return view;
+    });
     this.addRibbonIcon("layout-grid", "Open note masonry", () => void this.activateView());
     this.addSettingTab(new NoteMasonrySettingTab(this.app, this));
     this.registerDomEvent(document, "click", this.onCanvasLabelClickCapture, true);
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleCanvasHeaderUpdate()));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleCanvasHeaderUpdate()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleCanvasHeaderUpdate()));
+    this.app.workspace.onLayoutReady(() => this.updateCanvasHeaderButtons());
     this.updateBodyClass();
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
   async saveSettings() {
+    this.settings.scratchFolder = normalizeScratchFolder(this.settings.scratchFolder);
     await this.saveData(this.settings);
     this.updateBodyClass();
+    this.syncScratchFolderToViews();
+  }
+  /** 設定変更を既存の全KeepViewへ反映する */
+  syncScratchFolderToViews() {
+    try {
+      for (const leaf of this.app.workspace.getLeavesOfType(KEEP_VIEW_TYPE)) {
+        const view = leaf.view;
+        if (view instanceof KeepView) {
+          view.scratchFolder = this.settings.scratchFolder;
+        }
+      }
+    } catch (e) {
+    }
   }
   updateBodyClass() {
     document.body.toggleClass("note-masonry-canvas-label-split", this.settings.canvasLabelSplitEnabled);
   }
   onunload() {
     document.body.removeClass("note-masonry-canvas-label-split");
+    for (const el of this.canvasHeaderActions.values()) {
+      try {
+        el.remove();
+      } catch (e) {
+      }
+    }
+    this.canvasHeaderActions.clear();
+    if (this.headerUpdateTimer !== null) {
+      window.clearTimeout(this.headerUpdateTimer);
+      this.headerUpdateTimer = null;
+    }
+  }
+  scheduleCanvasHeaderUpdate() {
+    if (this.headerUpdateTimer !== null) {
+      window.clearTimeout(this.headerUpdateTimer);
+    }
+    this.headerUpdateTimer = window.setTimeout(() => {
+      this.headerUpdateTimer = null;
+      this.updateCanvasHeaderButtons();
+    }, 150);
+  }
+  /**
+   * canvasビューのview-header（3点メニュー左）にCard View絞り込みボタンを注入する。
+   * header再描画で消えるため冪等な再付与＋不要分の除去を行う。
+   */
+  updateCanvasHeaderButtons() {
+    try {
+      const canvasLeaves = this.app.workspace.getLeavesOfType("canvas");
+      const alive = new Set(canvasLeaves);
+      for (const [leaf, el] of Array.from(this.canvasHeaderActions.entries())) {
+        if (!alive.has(leaf)) {
+          try {
+            el.remove();
+          } catch (e) {
+          }
+          this.canvasHeaderActions.delete(leaf);
+          continue;
+        }
+        if (!el.isConnected) {
+          this.canvasHeaderActions.delete(leaf);
+        }
+      }
+      for (const leaf of canvasLeaves) {
+        if (this.canvasHeaderActions.has(leaf))
+          continue;
+        try {
+          const view = leaf.view;
+          if (!view || typeof view.addAction !== "function")
+            continue;
+          const canvasFile = view.file;
+          if (!(canvasFile instanceof import_obsidian.TFile) || canvasFile.extension !== "canvas")
+            continue;
+          const el = view.addAction("layout-grid", "\u3053\u306E\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30D5\u30A1\u30A4\u30EB\u3092Card View\u3067\u8868\u793A", () => {
+            const current = leaf.view.file;
+            if (current instanceof import_obsidian.TFile && current.extension === "canvas") {
+              void this.openCanvasFilteredView(current);
+            }
+          });
+          el.addClass("note-masonry-canvas-filter-btn");
+          el.setAttr("aria-label", "\u3053\u306E\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30D5\u30A1\u30A4\u30EB\u3092Card View\u3067\u8868\u793A");
+          this.canvasHeaderActions.set(leaf, el);
+        } catch (e) {
+        }
+      }
+    } catch (e) {
+    }
   }
   /**
    * 既存の右側リーフがあれば再利用し、なければ右にvertical分割を作って開く。
    * 同一ファイルを既に開いているリーフがあればそこを優先してペイン増殖を防ぐ。
+   * KeepView/canvas自体は再利用候補から除外する。
    */
   async openInRightSplit(file, canvasLeaf) {
     var _a;
     const ws = this.app.workspace;
     const leaves = [];
     ws.iterateRootLeaves((l) => leaves.push(l));
-    let target = null;
-    if (leaves.length > 1) {
+    const candidates = leaves.filter((l) => {
+      var _a2, _b;
       try {
-        const same = leaves.find((l) => {
+        const t = (_b = (_a2 = l.view).getViewType) == null ? void 0 : _b.call(_a2);
+        return t !== KEEP_VIEW_TYPE && t !== "canvas";
+      } catch (e) {
+        return true;
+      }
+    });
+    let target = null;
+    if (candidates.length > 0) {
+      try {
+        const same = candidates.find((l) => {
           var _a2;
           try {
             return ((_a2 = l.view.file) == null ? void 0 : _a2.path) === file.path;
@@ -1002,7 +1778,7 @@ var KeepPlugin = class extends import_obsidian.Plugin {
         if (same) {
           target = same;
         } else {
-          target = (_a = leaves.find((l) => l !== canvasLeaf)) != null ? _a : null;
+          target = (_a = candidates.find((l) => l !== canvasLeaf)) != null ? _a : null;
         }
       } catch (e) {
         target = null;
@@ -1013,6 +1789,47 @@ var KeepPlugin = class extends import_obsidian.Plugin {
     }
     await target.openFile(file);
     await ws.revealLeaf(target);
+  }
+  /**
+   * 指定canvasで絞り込んだCard Viewを右分割で開く。既存があれば再利用する。
+   */
+  async openCanvasFilteredView(canvasFile) {
+    const ws = this.app.workspace;
+    const keepLeaves = ws.getLeavesOfType(KEEP_VIEW_TYPE);
+    for (const leaf2 of keepLeaves) {
+      try {
+        const v = leaf2.view;
+        if (v instanceof KeepView && v.canvasSourcePath === canvasFile.path) {
+          await ws.revealLeaf(leaf2);
+          v.requestRender();
+          return;
+        }
+      } catch (e) {
+      }
+    }
+    const reusable = keepLeaves.find((leaf2) => {
+      try {
+        return leaf2.view.canvasSourcePath != null;
+      } catch (e) {
+        return false;
+      }
+    });
+    if (reusable) {
+      await reusable.setViewState({
+        type: KEEP_VIEW_TYPE,
+        active: true,
+        state: { canvasSourcePath: canvasFile.path }
+      });
+      await ws.revealLeaf(reusable);
+      return;
+    }
+    const leaf = ws.getLeaf("split", "vertical");
+    await leaf.setViewState({
+      type: KEEP_VIEW_TYPE,
+      active: true,
+      state: { canvasSourcePath: canvasFile.path }
+    });
+    await ws.revealLeaf(leaf);
   }
   async activateView() {
     const { workspace } = this.app;
@@ -1031,6 +1848,10 @@ var NoteMasonrySettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.empty();
     new import_obsidian.Setting(containerEl).setName("Canvas\u30E9\u30D9\u30EB\u30AF\u30EA\u30C3\u30AF\u3067\u53F3\u306B\u958B\u304F").setDesc("Canvas\u306E\u30D5\u30A1\u30A4\u30EB\u540D\u30E9\u30D9\u30EB\u3092\u5358\u7D14\u30AF\u30EA\u30C3\u30AF\u3067\u53F3\u306E\u5206\u5272\u30DA\u30A4\u30F3\u306B\u958B\u304D\u307E\u3059(\u306A\u3051\u308C\u3070\u4F5C\u6210)\u3002Cmd/Ctrl+\u30AF\u30EA\u30C3\u30AF\u306E\u65E2\u5B9A\u52D5\u4F5C\u306F\u7DAD\u6301\u3055\u308C\u307E\u3059\u3002").addToggle((toggle) => toggle.setValue(this.plugin.settings.canvasLabelSplitEnabled).onChange(async (value) => {
       this.plugin.settings.canvasLabelSplitEnabled = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u30C6\u30AD\u30B9\u30C8\u7DE8\u96C6\u7528\u30B9\u30AF\u30E9\u30C3\u30C1\u30D5\u30A9\u30EB\u30C0").setDesc("\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30C6\u30AD\u30B9\u30C8\u30AB\u30FC\u30C9\u3092\u5927\u30E2\u30FC\u30C0\u30EB\u3067\u7DE8\u96C6\u3059\u308B\u305F\u3081\u306E\u4F7F\u3044\u56DE\u3057\u30D5\u30A1\u30A4\u30EB\u306E\u7F6E\u304D\u5834\u6240\uFF08Vault\u76F8\u5BFE\u3001canvas\u3054\u3068\u306B1\u4EF6\u30FB\u81EA\u52D5\u524A\u9664\u306A\u3057\uFF09\u3002\u691C\u7D22\u7B49\u306B\u7D1B\u308C\u306A\u3044\u3088\u3046\u300C\u8A2D\u5B9A\u2192\u30D5\u30A1\u30A4\u30EB\u3068\u30EA\u30F3\u30AF\u2192\u9664\u5916\u30D5\u30A1\u30A4\u30EB\u300D\u3078\u306E\u767B\u9332\u3092\u63A8\u5968\u3057\u307E\u3059\u3002").addText((text) => text.setPlaceholder(DEFAULT_SCRATCH_FOLDER).setValue(this.plugin.settings.scratchFolder).onChange(async (value) => {
+      this.plugin.settings.scratchFolder = normalizeScratchFolder(value);
       await this.plugin.saveSettings();
     }));
   }
