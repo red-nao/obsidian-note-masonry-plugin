@@ -1,6 +1,8 @@
 import { App, ItemView, Plugin, WorkspaceLeaf, TFile, TFolder, Modal, setIcon, getAllTags } from 'obsidian';
 
 export const KEEP_VIEW_TYPE = "keep-view";
+const DEFAULT_TAG_FILTER = "#WIP";
+const RANDOM_FILE_COUNT = 15;
 
 class NoteEditModal extends Modal {
     file: TFile | null;
@@ -101,12 +103,16 @@ export class KeepView extends ItemView {
     folderSelect: HTMLSelectElement;
     tagSelect: HTMLSelectElement;
     searchInput: HTMLInputElement;
+    randomButton: HTMLButtonElement;
     private isRendering = false;
     private renderTimeout: NodeJS.Timeout | null = null;
+    private hasAppliedDefaultTagFilter = false;
     
     selectedFolder: string = '';
     selectedTag: string = '';
     searchQuery: string = '';
+    isRandomMode: boolean = false;
+    randomFiles: TFile[] = [];
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -134,9 +140,18 @@ export class KeepView extends ItemView {
     }
 
     async setState(state: Record<string, unknown>, result: Parameters<ItemView['setState']>[1]) {
-        this.selectedFolder = typeof state.selectedFolder === 'string' ? state.selectedFolder : '';
-        this.selectedTag = typeof state.selectedTag === 'string' ? state.selectedTag : '';
-        this.searchQuery = typeof state.searchQuery === 'string' ? state.searchQuery : '';
+        if (typeof state.selectedFolder === 'string') {
+            this.selectedFolder = state.selectedFolder;
+        }
+        if (typeof state.selectedTag === 'string') {
+            this.selectedTag = state.selectedTag;
+            this.hasAppliedDefaultTagFilter = true;
+        }
+        if (typeof state.searchQuery === 'string') {
+            this.searchQuery = state.searchQuery;
+        }
+        this.isRandomMode = false;
+        this.randomFiles = [];
         await super.setState(state, result);
         this.requestRender();
     }
@@ -154,6 +169,7 @@ export class KeepView extends ItemView {
         this.folderSelect.addEventListener('change', (e) => {
             this.selectedFolder = (e.target as HTMLSelectElement).value;
             this.adjustSelectWidth(this.folderSelect); 
+            this.exitRandomMode();
             this.requestRender();
         });
     
@@ -161,7 +177,17 @@ export class KeepView extends ItemView {
         this.tagSelect.addEventListener('change', (e) => {
             this.selectedTag = (e.target as HTMLSelectElement).value;
             this.adjustSelectWidth(this.tagSelect);   
+            this.exitRandomMode();
             this.requestRender();
+        });
+
+        this.randomButton = filterContainer.createEl('button', {
+            cls: 'keep-random-button',
+            attr: { 'aria-label': 'Show 15 random notes', 'title': 'ランダムに15件表示' },
+        });
+        setIcon(this.randomButton, 'shuffle');
+        this.randomButton.addEventListener('click', () => {
+            this.showRandomFiles();
         });
 
         const searchContainer = filterContainer.createEl('div', { cls: 'keep-search-container' });
@@ -184,6 +210,7 @@ export class KeepView extends ItemView {
         this.searchInput.addEventListener('input', (e) => {
             this.searchQuery = (e.target as HTMLInputElement).value;
             this.updateSearchVisibility();
+            this.exitRandomMode();
             this.requestRender();
         });
     
@@ -237,10 +264,52 @@ export class KeepView extends ItemView {
         }, 300);
     }
 
+    applyDefaultTagFilter() {
+        if (this.hasAppliedDefaultTagFilter) return;
+        if (this.selectedTag) {
+            this.hasAppliedDefaultTagFilter = true;
+            return;
+        }
+        // @ts-ignore
+        const tags: string[] = Object.keys(this.app.metadataCache.getTags() ?? {}).sort();
+        if (tags.length === 0) return;
+        if (tags.includes(DEFAULT_TAG_FILTER)) {
+            this.selectedTag = DEFAULT_TAG_FILTER;
+        } else {
+            this.selectedTag = tags[0];
+        }
+        this.hasAppliedDefaultTagFilter = true;
+    }
+
+    showRandomFiles() {
+        const all = this.app.vault.getMarkdownFiles();
+        for (let i = all.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [all[i], all[j]] = [all[j], all[i]];
+        }
+        this.randomFiles = all.slice(0, RANDOM_FILE_COUNT);
+        this.isRandomMode = true;
+        this.updateRandomButtonState();
+        this.requestRender();
+    }
+
+    exitRandomMode() {
+        if (!this.isRandomMode) return;
+        this.isRandomMode = false;
+        this.randomFiles = [];
+        this.updateRandomButtonState();
+    }
+
+    updateRandomButtonState() {
+        if (this.randomButton) {
+            this.randomButton.toggleClass('is-active', this.isRandomMode);
+        }
+    }
+
     updateFilterUI() {
         const folders = this.app.vault.getAllLoadedFiles().filter((f): f is TFolder => f instanceof TFolder);
         // @ts-ignore
-        const tags = Object.keys(this.app.metadataCache.getTags());
+        const tags: string[] = Object.keys(this.app.metadataCache.getTags()).sort();
 
         if (this.folderSelect.options.length !== folders.length + 1) {
             const currentFolder = this.selectedFolder;
@@ -300,44 +369,55 @@ export class KeepView extends ItemView {
         this.isRendering = true;
 
         try {
+            this.applyDefaultTagFilter();
             this.updateFilterUI();
+            this.updateRandomButtonState();
 
-            let files = this.app.vault.getMarkdownFiles();
-            
-            if (this.selectedFolder) {
-                files = files.filter(f => f.parent?.path === this.selectedFolder || f.parent?.path.startsWith(this.selectedFolder + '/'));
-            }
-            
-            if (this.selectedTag) {
-                files = files.filter(f => {
-                    const cache = this.app.metadataCache.getFileCache(f);
-                    const tags = cache ? getAllTags(cache) || [] : [];
-                    return tags.includes(this.selectedTag);
-                });
-            }
+            let files: TFile[];
 
-            if (this.searchQuery) {
-                const query = this.searchQuery.toLowerCase();
-                const searchPromises = files.map(async (f) => {
-                    const content = await this.app.vault.cachedRead(f);
-                    const cache = this.app.metadataCache.getFileCache(f);
-                    
-                    if (f.basename.toLowerCase().includes(query)) {
-                        return true;
-                    }
-                    
-                    let contentWithoutFrontmatter = content;
-                    if (cache?.frontmatterPosition) {
-                        contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
-                    } else {
-                        contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
-                    }
-                    
-                    return contentWithoutFrontmatter.toLowerCase().includes(query);
-                });
+            if (this.isRandomMode) {
+                const existingPaths = new Set(this.app.vault.getMarkdownFiles().map(f => f.path));
+                files = this.randomFiles.filter(f => existingPaths.has(f.path));
+            } else {
+                let filtered = this.app.vault.getMarkdownFiles();
                 
-                const searchResults = await Promise.all(searchPromises);
-                files = files.filter((_, index) => searchResults[index]);
+                if (this.selectedFolder) {
+                    filtered = filtered.filter(f => f.parent?.path === this.selectedFolder || f.parent?.path.startsWith(this.selectedFolder + '/'));
+                }
+                
+                if (this.selectedTag) {
+                    filtered = filtered.filter(f => {
+                        const cache = this.app.metadataCache.getFileCache(f);
+                        const tags = cache ? getAllTags(cache) || [] : [];
+                        return tags.includes(this.selectedTag);
+                    });
+                }
+
+                if (this.searchQuery) {
+                    const query = this.searchQuery.toLowerCase();
+                    const searchPromises = filtered.map(async (f) => {
+                        const content = await this.app.vault.cachedRead(f);
+                        const cache = this.app.metadataCache.getFileCache(f);
+                        
+                        if (f.basename.toLowerCase().includes(query)) {
+                            return true;
+                        }
+                        
+                        let contentWithoutFrontmatter = content;
+                        if (cache?.frontmatterPosition) {
+                            contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
+                        } else {
+                            contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+                        }
+                        
+                        return contentWithoutFrontmatter.toLowerCase().includes(query);
+                    });
+                    
+                    const searchResults = await Promise.all(searchPromises);
+                    filtered = filtered.filter((_, index) => searchResults[index]);
+                }
+
+                files = filtered;
             }
 
             files.sort((a, b) => b.stat.mtime - a.stat.mtime);

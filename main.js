@@ -30,6 +30,8 @@ __export(main_exports, {
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var KEEP_VIEW_TYPE = "keep-view";
+var DEFAULT_TAG_FILTER = "#WIP";
+var RANDOM_FILE_COUNT = 15;
 var NoteEditModal = class extends import_obsidian.Modal {
   constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "") {
     super(app);
@@ -114,9 +116,12 @@ var KeepView = class extends import_obsidian.ItemView {
     super(leaf);
     this.isRendering = false;
     this.renderTimeout = null;
+    this.hasAppliedDefaultTagFilter = false;
     this.selectedFolder = "";
     this.selectedTag = "";
     this.searchQuery = "";
+    this.isRandomMode = false;
+    this.randomFiles = [];
   }
   getViewType() {
     return KEEP_VIEW_TYPE;
@@ -136,9 +141,18 @@ var KeepView = class extends import_obsidian.ItemView {
     };
   }
   async setState(state, result) {
-    this.selectedFolder = typeof state.selectedFolder === "string" ? state.selectedFolder : "";
-    this.selectedTag = typeof state.selectedTag === "string" ? state.selectedTag : "";
-    this.searchQuery = typeof state.searchQuery === "string" ? state.searchQuery : "";
+    if (typeof state.selectedFolder === "string") {
+      this.selectedFolder = state.selectedFolder;
+    }
+    if (typeof state.selectedTag === "string") {
+      this.selectedTag = state.selectedTag;
+      this.hasAppliedDefaultTagFilter = true;
+    }
+    if (typeof state.searchQuery === "string") {
+      this.searchQuery = state.searchQuery;
+    }
+    this.isRandomMode = false;
+    this.randomFiles = [];
     await super.setState(state, result);
     this.requestRender();
   }
@@ -152,13 +166,23 @@ var KeepView = class extends import_obsidian.ItemView {
     this.folderSelect.addEventListener("change", (e) => {
       this.selectedFolder = e.target.value;
       this.adjustSelectWidth(this.folderSelect);
+      this.exitRandomMode();
       this.requestRender();
     });
     this.tagSelect = leftFilters.createEl("select", { cls: "keep-select" });
     this.tagSelect.addEventListener("change", (e) => {
       this.selectedTag = e.target.value;
       this.adjustSelectWidth(this.tagSelect);
+      this.exitRandomMode();
       this.requestRender();
+    });
+    this.randomButton = filterContainer.createEl("button", {
+      cls: "keep-random-button",
+      attr: { "aria-label": "Show 15 random notes", "title": "\u30E9\u30F3\u30C0\u30E0\u306B15\u4EF6\u8868\u793A" }
+    });
+    (0, import_obsidian.setIcon)(this.randomButton, "shuffle");
+    this.randomButton.addEventListener("click", () => {
+      this.showRandomFiles();
     });
     const searchContainer = filterContainer.createEl("div", { cls: "keep-search-container" });
     const searchWrapper = searchContainer.createEl("div", { cls: "keep-search-wrapper" });
@@ -175,6 +199,7 @@ var KeepView = class extends import_obsidian.ItemView {
     this.searchInput.addEventListener("input", (e) => {
       this.searchQuery = e.target.value;
       this.updateSearchVisibility();
+      this.exitRandomMode();
       this.requestRender();
     });
     this.searchInput.addEventListener("focus", () => {
@@ -217,9 +242,50 @@ var KeepView = class extends import_obsidian.ItemView {
       void this.renderGrid();
     }, 300);
   }
+  applyDefaultTagFilter() {
+    var _a;
+    if (this.hasAppliedDefaultTagFilter)
+      return;
+    if (this.selectedTag) {
+      this.hasAppliedDefaultTagFilter = true;
+      return;
+    }
+    const tags = Object.keys((_a = this.app.metadataCache.getTags()) != null ? _a : {}).sort();
+    if (tags.length === 0)
+      return;
+    if (tags.includes(DEFAULT_TAG_FILTER)) {
+      this.selectedTag = DEFAULT_TAG_FILTER;
+    } else {
+      this.selectedTag = tags[0];
+    }
+    this.hasAppliedDefaultTagFilter = true;
+  }
+  showRandomFiles() {
+    const all = this.app.vault.getMarkdownFiles();
+    for (let i = all.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [all[i], all[j]] = [all[j], all[i]];
+    }
+    this.randomFiles = all.slice(0, RANDOM_FILE_COUNT);
+    this.isRandomMode = true;
+    this.updateRandomButtonState();
+    this.requestRender();
+  }
+  exitRandomMode() {
+    if (!this.isRandomMode)
+      return;
+    this.isRandomMode = false;
+    this.randomFiles = [];
+    this.updateRandomButtonState();
+  }
+  updateRandomButtonState() {
+    if (this.randomButton) {
+      this.randomButton.toggleClass("is-active", this.isRandomMode);
+    }
+  }
   updateFilterUI() {
     const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian.TFolder);
-    const tags = Object.keys(this.app.metadataCache.getTags());
+    const tags = Object.keys(this.app.metadataCache.getTags()).sort();
     if (this.folderSelect.options.length !== folders.length + 1) {
       const currentFolder = this.selectedFolder;
       this.folderSelect.empty();
@@ -273,39 +339,48 @@ var KeepView = class extends import_obsidian.ItemView {
       return;
     this.isRendering = true;
     try {
+      this.applyDefaultTagFilter();
       this.updateFilterUI();
-      let files = this.app.vault.getMarkdownFiles();
-      if (this.selectedFolder) {
-        files = files.filter((f) => {
-          var _a2, _b;
-          return ((_a2 = f.parent) == null ? void 0 : _a2.path) === this.selectedFolder || ((_b = f.parent) == null ? void 0 : _b.path.startsWith(this.selectedFolder + "/"));
-        });
-      }
-      if (this.selectedTag) {
-        files = files.filter((f) => {
-          const cache = this.app.metadataCache.getFileCache(f);
-          const tags = cache ? (0, import_obsidian.getAllTags)(cache) || [] : [];
-          return tags.includes(this.selectedTag);
-        });
-      }
-      if (this.searchQuery) {
-        const query = this.searchQuery.toLowerCase();
-        const searchPromises = files.map(async (f) => {
-          const content = await this.app.vault.cachedRead(f);
-          const cache = this.app.metadataCache.getFileCache(f);
-          if (f.basename.toLowerCase().includes(query)) {
-            return true;
-          }
-          let contentWithoutFrontmatter = content;
-          if (cache == null ? void 0 : cache.frontmatterPosition) {
-            contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
-          } else {
-            contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
-          }
-          return contentWithoutFrontmatter.toLowerCase().includes(query);
-        });
-        const searchResults = await Promise.all(searchPromises);
-        files = files.filter((_, index) => searchResults[index]);
+      this.updateRandomButtonState();
+      let files;
+      if (this.isRandomMode) {
+        const existingPaths = new Set(this.app.vault.getMarkdownFiles().map((f) => f.path));
+        files = this.randomFiles.filter((f) => existingPaths.has(f.path));
+      } else {
+        let filtered = this.app.vault.getMarkdownFiles();
+        if (this.selectedFolder) {
+          filtered = filtered.filter((f) => {
+            var _a2, _b;
+            return ((_a2 = f.parent) == null ? void 0 : _a2.path) === this.selectedFolder || ((_b = f.parent) == null ? void 0 : _b.path.startsWith(this.selectedFolder + "/"));
+          });
+        }
+        if (this.selectedTag) {
+          filtered = filtered.filter((f) => {
+            const cache = this.app.metadataCache.getFileCache(f);
+            const tags = cache ? (0, import_obsidian.getAllTags)(cache) || [] : [];
+            return tags.includes(this.selectedTag);
+          });
+        }
+        if (this.searchQuery) {
+          const query = this.searchQuery.toLowerCase();
+          const searchPromises = filtered.map(async (f) => {
+            const content = await this.app.vault.cachedRead(f);
+            const cache = this.app.metadataCache.getFileCache(f);
+            if (f.basename.toLowerCase().includes(query)) {
+              return true;
+            }
+            let contentWithoutFrontmatter = content;
+            if (cache == null ? void 0 : cache.frontmatterPosition) {
+              contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
+            } else {
+              contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+            }
+            return contentWithoutFrontmatter.toLowerCase().includes(query);
+          });
+          const searchResults = await Promise.all(searchPromises);
+          filtered = filtered.filter((_, index) => searchResults[index]);
+        }
+        files = filtered;
       }
       files.sort((a, b) => b.stat.mtime - a.stat.mtime);
       const pinnedFiles = [];

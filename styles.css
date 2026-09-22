@@ -157,6 +157,40 @@
     box-shadow: none;
 }
 
+.keep-filter-container .keep-random-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    box-shadow: none;
+    border-radius: 999px;
+    border: none;
+    background-color: transparent;
+    color: var(--color-base-40);
+    cursor: pointer;
+    transition: background-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease, color 0.2s ease;
+}
+
+.keep-random-button:hover {
+    background-color: var(--background-modifier-hover);
+    color: var(--text-normal);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+.keep-random-button:active {
+    transform: translateY(1px);
+    color: var(--text-normal);
+    box-shadow: none;
+}
+
+.keep-random-button.is-active {
+    background-color: var(--background-modifier-hover);
+    color: var(--text-accent);
+}
+
 
 .keep-section-title {
     margin: 0 0 16px 0;
