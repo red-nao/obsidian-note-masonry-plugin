@@ -32,6 +32,10 @@ var import_obsidian = require("obsidian");
 var KEEP_VIEW_TYPE = "keep-view";
 var DEFAULT_TAG_FILTER = "#WIP";
 var RANDOM_FILE_COUNT = 15;
+var RENDER_INITIAL_LIMIT = 100;
+var RENDER_MORE_STEP = 100;
+var SEARCH_CONTENT_BATCH = 40;
+var RENDER_YIELD_EVERY = 20;
 var DEFAULT_SCRATCH_FOLDER = "__masonry-scratch";
 var DEFAULT_SETTINGS = {
   canvasLabelSplitEnabled: true,
@@ -40,10 +44,6 @@ var DEFAULT_SETTINGS = {
 function normalizeScratchFolder(raw) {
   const cleaned = (raw != null ? raw : "").replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
   return cleaned || DEFAULT_SCRATCH_FOLDER;
-}
-function sanitizeFileName(raw) {
-  const cleaned = (raw != null ? raw : "").replace(/[\/\\:#|?*<>"]/g, "-").trim();
-  return cleaned || "untitled";
 }
 var NoteEditModal = class {
   constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "", hideTitle = false) {
@@ -266,7 +266,7 @@ var NoteEditModal = class {
     this.onCloseCallback();
   }
 };
-var KeepView = class extends import_obsidian.ItemView {
+var _KeepView = class extends import_obsidian.ItemView {
   constructor(leaf) {
     super(leaf);
     this.filterContainer = null;
@@ -274,12 +274,29 @@ var KeepView = class extends import_obsidian.ItemView {
     this.createButton = null;
     this.canvasBanner = null;
     this.isRendering = false;
+    this.pendingRender = false;
     this.renderTimeout = null;
     this.hasAppliedDefaultTagFilter = false;
     this.canvasFocusCycle = {};
     /** テキスト編集用スクラッチの格納フォルダ（KeepPluginから注入される） */
     this.scratchFolder = DEFAULT_SCRATCH_FOLDER;
     this.activeTextSession = null;
+    /** ページネーション・キャッシュ用 */
+    this.renderLimit = RENDER_INITIAL_LIMIT;
+    this.lastFilterKey = "";
+    this.displayPinned = [];
+    this.displayUnpinned = [];
+    this.displayContentCache = /* @__PURE__ */ new Map();
+    this.unpinnedGridEl = null;
+    this.moreSentinelEl = null;
+    this.moreObserver = null;
+    this.searchWrapperEl = null;
+    this.lastFolderPaths = null;
+    this.lastTagList = null;
+    this.lastFolderValue = "\0";
+    this.lastTagValue = "\0";
+    this.normalizedScratchCache = DEFAULT_SCRATCH_FOLDER;
+    this.normalizedScratchSource = null;
     this.selectedFolder = "";
     this.selectedTag = "";
     this.searchQuery = "";
@@ -295,6 +312,13 @@ var KeepView = class extends import_obsidian.ItemView {
   }
   getIcon() {
     return "layout-grid";
+  }
+  async onClose() {
+    this.disconnectMoreObserver();
+    if (this.renderTimeout) {
+      clearTimeout(this.renderTimeout);
+      this.renderTimeout = null;
+    }
   }
   getState() {
     return {
@@ -396,17 +420,37 @@ var KeepView = class extends import_obsidian.ItemView {
     this.createButton = createButton;
     (0, import_obsidian.setIcon)(createButton, "plus");
     createButton.addEventListener("click", () => {
-      new NoteEditModal(this.app, null, this.leaf, () => this.requestRender(), this.selectedFolder, this.selectedTag).open();
+      this.openNoteModal(null, { selectedFolder: this.selectedFolder, selectedTag: this.selectedTag });
     });
     this.canvasBanner = container.createEl("div", { cls: "keep-canvas-banner" });
     this.canvasBanner.hide();
     this.gridContainer = container.createEl("div", { cls: "keep-grid-wrapper" });
-    this.registerEvent(this.app.vault.on("create", () => this.requestRender()));
-    this.registerEvent(this.app.vault.on("modify", () => this.requestRender()));
-    this.registerEvent(this.app.vault.on("delete", () => this.requestRender()));
-    this.registerEvent(this.app.vault.on("rename", () => this.requestRender()));
-    this.registerEvent(this.app.metadataCache.on("changed", () => this.requestRender()));
+    this.searchWrapperEl = searchWrapper;
+    this.registerEvent(this.app.vault.on("create", (f) => {
+      if (f instanceof import_obsidian.TFile && this.isScratchFile(f))
+        return;
+      this.requestRender(300);
+    }));
+    this.registerEvent(this.app.vault.on("modify", (f) => {
+      if (f instanceof import_obsidian.TFile && this.isScratchFile(f))
+        return;
+      if (f instanceof import_obsidian.TFile && f.extension === "canvas" && !this.isCanvasMode())
+        return;
+      this.requestRender(600);
+    }));
+    this.registerEvent(this.app.vault.on("delete", (f) => {
+      if (f instanceof import_obsidian.TFile && this.isScratchFile(f))
+        return;
+      this.requestRender(300);
+    }));
+    this.registerEvent(this.app.vault.on("rename", () => this.requestRender(300)));
+    this.registerEvent(this.app.metadataCache.on("changed", (f) => {
+      if (f instanceof import_obsidian.TFile && this.isScratchFile(f))
+        return;
+      this.requestRender(600);
+    }));
     this.updateCanvasModeUI();
+    void this.cleanupLegacyScratchFiles();
     await this.renderGrid();
   }
   /** canvasモードではフォルダ/タグ/ランダム/新規作成を隠し、検索バーのみ＋バナーを表示する */
@@ -511,7 +555,10 @@ var KeepView = class extends import_obsidian.ItemView {
     return file.extension === "md";
   }
   updateSearchVisibility() {
-    const searchWrapper = this.containerEl.querySelector(".keep-search-wrapper");
+    var _a;
+    const searchWrapper = (_a = this.searchWrapperEl) != null ? _a : this.containerEl.querySelector(".keep-search-wrapper");
+    if (!this.searchWrapperEl && searchWrapper)
+      this.searchWrapperEl = searchWrapper;
     if (searchWrapper) {
       if (this.searchQuery) {
         searchWrapper.addClass("has-value");
@@ -520,13 +567,48 @@ var KeepView = class extends import_obsidian.ItemView {
       }
     }
   }
-  requestRender() {
+  /**
+   * 編集モーダルを開く共通ヘルパー。開いている間は requestRender を抑止して
+   * 背後のカードViewが編集中にちらつかないようにし、閉じた後に1回だけ再描画する。
+   */
+  openNoteModal(file, opts = {}) {
+    var _a, _b, _c;
+    _KeepView.openModalCount++;
+    let closed = false;
+    const doClose = () => {
+      var _a2;
+      if (closed)
+        return;
+      closed = true;
+      _KeepView.openModalCount = Math.max(0, _KeepView.openModalCount - 1);
+      try {
+        (_a2 = opts.onClosed) == null ? void 0 : _a2.call(opts);
+      } finally {
+        if (opts.renderOnClose !== false)
+          this.requestRender();
+      }
+    };
+    try {
+      new NoteEditModal(this.app, file, this.leaf, doClose, (_a = opts.selectedFolder) != null ? _a : "", (_b = opts.selectedTag) != null ? _b : "", (_c = opts.hideTitle) != null ? _c : false).open();
+    } catch (e) {
+      doClose();
+      throw e;
+    }
+  }
+  requestRender(delay = 300) {
+    if (_KeepView.openModalCount > 0)
+      return;
     if (this.renderTimeout) {
       clearTimeout(this.renderTimeout);
     }
     this.renderTimeout = setTimeout(() => {
+      this.renderTimeout = null;
+      if (this.isRendering) {
+        this.pendingRender = true;
+        return;
+      }
       void this.renderGrid();
-    }, 300);
+    }, delay);
   }
   applyDefaultTagFilter() {
     var _a;
@@ -569,10 +651,20 @@ var KeepView = class extends import_obsidian.ItemView {
       this.randomButton.toggleClass("is-active", this.isRandomMode);
     }
   }
+  isSameStringArray(a, b) {
+    if (!a || a.length !== b.length)
+      return false;
+    for (let i = 0; i < b.length; i++) {
+      if (a[i] !== b[i])
+        return false;
+    }
+    return true;
+  }
   updateFilterUI() {
     const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian.TFolder);
     const tags = Object.keys(this.app.metadataCache.getTags()).sort();
-    if (this.folderSelect.options.length !== folders.length + 1) {
+    const folderPaths = folders.map((f) => f.path);
+    if (!this.isSameStringArray(this.lastFolderPaths, folderPaths) || this.folderSelect.options.length !== folders.length + 1) {
       const currentFolder = this.selectedFolder;
       this.folderSelect.empty();
       this.folderSelect.createEl("option", { value: "", text: "All folders" });
@@ -583,8 +675,10 @@ var KeepView = class extends import_obsidian.ItemView {
         if (f.path === currentFolder)
           option.selected = true;
       });
+      this.lastFolderPaths = folderPaths;
+      this.lastFolderValue = "\0";
     }
-    if (this.tagSelect.options.length !== tags.length + 1) {
+    if (!this.isSameStringArray(this.lastTagList, tags) || this.tagSelect.options.length !== tags.length + 1) {
       const currentTag = this.selectedTag;
       this.tagSelect.empty();
       this.tagSelect.createEl("option", { value: "", text: "All tags" });
@@ -593,14 +687,32 @@ var KeepView = class extends import_obsidian.ItemView {
         if (t === currentTag)
           option.selected = true;
       });
+      this.lastTagList = tags.slice();
+      this.lastTagValue = "\0";
     }
-    this.folderSelect.value = this.selectedFolder;
-    this.adjustSelectWidth(this.folderSelect);
-    this.tagSelect.value = this.selectedTag;
-    this.adjustSelectWidth(this.tagSelect);
+    if (this.folderSelect.value !== this.selectedFolder) {
+      this.folderSelect.value = this.selectedFolder;
+    }
+    if (this.lastFolderValue !== this.selectedFolder) {
+      this.adjustSelectWidth(this.folderSelect);
+      this.lastFolderValue = this.selectedFolder;
+    }
+    if (this.tagSelect.value !== this.selectedTag) {
+      this.tagSelect.value = this.selectedTag;
+    }
+    if (this.lastTagValue !== this.selectedTag) {
+      this.adjustSelectWidth(this.tagSelect);
+      this.lastTagValue = this.selectedTag;
+    }
   }
   adjustSelectWidth(select) {
     if (!select || select.options.length === 0)
+      return;
+    const selected = select.options[select.selectedIndex];
+    if (!selected)
+      return;
+    const cacheKey = selected.text;
+    if (select.dataset.lastWidthFor === cacheKey)
       return;
     const tempSpan = document.createElement("span");
     tempSpan.setCssProps({
@@ -613,16 +725,103 @@ var KeepView = class extends import_obsidian.ItemView {
       "font-size": computedStyle.fontSize,
       "font-family": computedStyle.fontFamily
     });
-    tempSpan.innerText = select.options[select.selectedIndex].text;
+    tempSpan.innerText = cacheKey;
     document.body.appendChild(tempSpan);
     const textWidth = tempSpan.getBoundingClientRect().width;
     document.body.removeChild(tempSpan);
     select.style.width = `${textWidth + 20}px`;
+    select.dataset.lastWidthFor = cacheKey;
+  }
+  /** フィルタ条件のキー。変わったときだけページネーションをリセットする */
+  getFilterKey() {
+    var _a;
+    return `${this.selectedFolder}
+${this.selectedTag}
+${this.searchQuery}
+${this.isRandomMode ? "R" : ""}
+${(_a = this.canvasSourcePath) != null ? _a : ""}`;
+  }
+  /** frontmatterを除いた本文を取り出す（検索・スニペット共通） */
+  stripFrontmatter(content, file) {
+    try {
+      const cache = this.app.metadataCache.getFileCache(file);
+      if (cache == null ? void 0 : cache.frontmatterPosition) {
+        return content.substring(cache.frontmatterPosition.end.offset);
+      }
+    } catch (e) {
+    }
+    if (content.charCodeAt(0) === 45 && content.startsWith("---")) {
+      return content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+    }
+    return content;
+  }
+  async readCachedWithCache(file, cache) {
+    const hit = cache.get(file.path);
+    if (hit !== void 0)
+      return hit;
+    const content = await this.app.vault.cachedRead(file);
+    if (cache.size > 500) {
+      const first = cache.keys().next();
+      if (!first.done)
+        cache.delete(first.value);
+    }
+    cache.set(file.path, content);
+    return content;
+  }
+  /**
+   * 本文検索。basename一致を先に確定させ、残りだけ本文読み＋バッチ処理する。
+   * 読み込んだ本文はcontentCacheに残し、カード描画での二重読みを避ける。
+   */
+  async filterBySearchQuery(files, query, contentCache) {
+    const matched = [];
+    const needContent = [];
+    const matchedPaths = /* @__PURE__ */ new Set();
+    for (const f of files) {
+      if (f.basename.toLowerCase().includes(query) || f.path.toLowerCase().includes(query)) {
+        matched.push(f);
+        matchedPaths.add(f.path);
+      } else {
+        needContent.push(f);
+      }
+    }
+    if (needContent.length === 0)
+      return matched;
+    const contentMatched = [];
+    for (let i = 0; i < needContent.length; i += SEARCH_CONTENT_BATCH) {
+      const slice = needContent.slice(i, i + SEARCH_CONTENT_BATCH);
+      const results = await Promise.all(slice.map(async (f) => {
+        try {
+          const content = await this.readCachedWithCache(f, contentCache);
+          const body = this.stripFrontmatter(content, f);
+          return body.toLowerCase().includes(query);
+        } catch (e) {
+          return false;
+        }
+      }));
+      for (let j = 0; j < slice.length; j++) {
+        if (results[j])
+          contentMatched.push(slice[j]);
+      }
+      if (i + SEARCH_CONTENT_BATCH < needContent.length) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    if (contentMatched.length === 0)
+      return matched;
+    const contentSet = new Set(contentMatched.map((f) => f.path));
+    const out = [];
+    for (const f of files) {
+      if (matchedPaths.has(f.path) || contentSet.has(f.path))
+        out.push(f);
+    }
+    return out;
   }
   async renderGrid() {
     var _a;
-    if (this.isRendering)
+    if (this.isRendering) {
+      this.pendingRender = true;
       return;
+    }
     this.isRendering = true;
     try {
       this.updateCanvasModeUI();
@@ -633,43 +832,37 @@ var KeepView = class extends import_obsidian.ItemView {
       this.applyDefaultTagFilter();
       this.updateFilterUI();
       this.updateRandomButtonState();
+      const filterKey = this.getFilterKey();
+      if (filterKey !== this.lastFilterKey) {
+        this.renderLimit = RENDER_INITIAL_LIMIT;
+        this.lastFilterKey = filterKey;
+      }
       let files;
+      const contentCache = /* @__PURE__ */ new Map();
       if (this.isRandomMode) {
-        const existingPaths = new Set(this.app.vault.getMarkdownFiles().map((f) => f.path));
+        const allMarkdown = this.app.vault.getMarkdownFiles();
+        const existingPaths = new Set(allMarkdown.map((f) => f.path));
         files = this.randomFiles.filter((f) => existingPaths.has(f.path) && !this.isScratchFile(f));
       } else {
         let filtered = this.app.vault.getMarkdownFiles().filter((f) => !this.isScratchFile(f));
         if (this.selectedFolder) {
+          const prefix = this.selectedFolder + "/";
           filtered = filtered.filter((f) => {
             var _a2, _b;
-            return ((_a2 = f.parent) == null ? void 0 : _a2.path) === this.selectedFolder || ((_b = f.parent) == null ? void 0 : _b.path.startsWith(this.selectedFolder + "/"));
+            return ((_a2 = f.parent) == null ? void 0 : _a2.path) === this.selectedFolder || ((_b = f.parent) == null ? void 0 : _b.path.startsWith(prefix));
           });
         }
         if (this.selectedTag) {
+          const tag = this.selectedTag;
           filtered = filtered.filter((f) => {
             const cache = this.app.metadataCache.getFileCache(f);
             const tags = cache ? (0, import_obsidian.getAllTags)(cache) || [] : [];
-            return tags.includes(this.selectedTag);
+            return tags.includes(tag);
           });
         }
         if (this.searchQuery) {
           const query = this.searchQuery.toLowerCase();
-          const searchPromises = filtered.map(async (f) => {
-            const content = await this.app.vault.cachedRead(f);
-            const cache = this.app.metadataCache.getFileCache(f);
-            if (f.basename.toLowerCase().includes(query)) {
-              return true;
-            }
-            let contentWithoutFrontmatter = content;
-            if (cache == null ? void 0 : cache.frontmatterPosition) {
-              contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
-            } else {
-              contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
-            }
-            return contentWithoutFrontmatter.toLowerCase().includes(query);
-          });
-          const searchResults = await Promise.all(searchPromises);
-          filtered = filtered.filter((_, index) => searchResults[index]);
+          filtered = await this.filterBySearchQuery(filtered, query, contentCache);
         }
         files = filtered;
       }
@@ -684,19 +877,102 @@ var KeepView = class extends import_obsidian.ItemView {
         else
           unpinnedFiles.push(file);
       }
+      this.displayPinned = pinnedFiles;
+      this.displayUnpinned = unpinnedFiles;
+      this.displayContentCache = contentCache;
+      this.disconnectMoreObserver();
       this.gridContainer.empty();
+      this.unpinnedGridEl = null;
+      this.moreSentinelEl = null;
       if (pinnedFiles.length > 0) {
         this.gridContainer.createEl("h3", { text: "Pinned", cls: "keep-section-title" });
         const pinnedGrid = this.gridContainer.createEl("div", { cls: "keep-grid" });
-        await this.renderCards(pinnedFiles, pinnedGrid);
+        await this.renderCards(pinnedFiles, pinnedGrid, contentCache);
         if (unpinnedFiles.length > 0) {
           this.gridContainer.createEl("h3", { text: "Others", cls: "keep-section-title keep-section-title-others" });
         }
       }
       const unpinnedGrid = this.gridContainer.createEl("div", { cls: "keep-grid" });
-      await this.renderCards(unpinnedFiles, unpinnedGrid);
+      this.unpinnedGridEl = unpinnedGrid;
+      const visible = unpinnedFiles.slice(0, Math.max(0, this.renderLimit - pinnedFiles.length));
+      await this.renderCards(visible, unpinnedGrid, contentCache);
+      this.setupMoreUI(unpinnedFiles.length, visible.length);
     } finally {
       this.isRendering = false;
+      if (this.pendingRender) {
+        this.pendingRender = false;
+        this.requestRender(100);
+      }
+    }
+  }
+  disconnectMoreObserver() {
+    if (this.moreObserver) {
+      try {
+        this.moreObserver.disconnect();
+      } catch (e) {
+      }
+      this.moreObserver = null;
+    }
+  }
+  /** 残り件数表示＋自動追加（IntersectionObserver）で初回描画を軽く保つ */
+  setupMoreUI(total, rendered) {
+    const rest = total - rendered;
+    if (rest <= 0)
+      return;
+    const moreWrap = this.gridContainer.createEl("div", { cls: "keep-more-wrap" });
+    const btn = moreWrap.createEl("button", {
+      cls: "keep-more-button",
+      text: `\u3055\u3089\u306B\u8868\u793A (${rendered}/${total})`
+    });
+    btn.addEventListener("click", () => void this.renderMore());
+    this.moreSentinelEl = moreWrap;
+    try {
+      this.moreObserver = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) {
+            void this.renderMore();
+            break;
+          }
+        }
+      }, { rootMargin: "600px" });
+      this.moreObserver.observe(moreWrap);
+    } catch (e) {
+    }
+  }
+  async renderMore() {
+    if (this.isRendering)
+      return;
+    if (!this.unpinnedGridEl || !this.moreSentinelEl)
+      return;
+    const total = this.displayUnpinned.length;
+    const rendered = this.unpinnedGridEl.children.length;
+    if (rendered >= total) {
+      this.moreSentinelEl.remove();
+      this.moreSentinelEl = null;
+      this.disconnectMoreObserver();
+      return;
+    }
+    this.isRendering = true;
+    try {
+      this.renderLimit += RENDER_MORE_STEP;
+      const next = this.displayUnpinned.slice(rendered, rendered + RENDER_MORE_STEP);
+      await this.renderCards(next, this.unpinnedGridEl, this.displayContentCache);
+      const now = this.unpinnedGridEl.children.length;
+      if (now >= total) {
+        this.moreSentinelEl.remove();
+        this.moreSentinelEl = null;
+        this.disconnectMoreObserver();
+      } else {
+        const btn = this.moreSentinelEl.querySelector(".keep-more-button");
+        if (btn)
+          btn.setText(`\u3055\u3089\u306B\u8868\u793A (${now}/${total})`);
+      }
+    } finally {
+      this.isRendering = false;
+      if (this.pendingRender) {
+        this.pendingRender = false;
+        this.requestRender(100);
+      }
     }
   }
   /** canvasモード専用: そのcanvas内のfile/textノードを配置順で表示し、検索バーで絞り込む */
@@ -711,14 +987,26 @@ var KeepView = class extends import_obsidian.ItemView {
       return;
     }
     let items = await this.loadCanvasGridItems(canvasFile);
+    const canvasContentCache = /* @__PURE__ */ new Map();
     if (this.searchQuery) {
       const query = this.searchQuery.toLowerCase();
-      const results = await Promise.all(items.map((item) => {
-        if (item.kind === "file")
-          return this.matchesCanvasSearch(item.file, query);
-        return Promise.resolve(item.text.toLowerCase().includes(query));
-      }));
-      items = items.filter((_, i) => results[i]);
+      const out = [];
+      for (let i = 0; i < items.length; i += SEARCH_CONTENT_BATCH) {
+        const slice = items.slice(i, i + SEARCH_CONTENT_BATCH);
+        const results = await Promise.all(slice.map((item) => {
+          if (item.kind === "file")
+            return this.matchesCanvasSearch(item.file, query, canvasContentCache);
+          return Promise.resolve(item.text.toLowerCase().includes(query));
+        }));
+        for (let j = 0; j < slice.length; j++) {
+          if (results[j])
+            out.push(slice[j]);
+        }
+        if (i + SEARCH_CONTENT_BATCH < items.length) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+      items = out;
     }
     if (items.length === 0) {
       this.gridContainer.createEl("div", {
@@ -728,9 +1016,9 @@ var KeepView = class extends import_obsidian.ItemView {
       return;
     }
     const grid = this.gridContainer.createEl("div", { cls: "keep-grid" });
-    await this.renderCanvasCards(items, grid);
+    await this.renderCanvasCards(items, grid, canvasContentCache);
   }
-  async matchesCanvasSearch(file, query) {
+  async matchesCanvasSearch(file, query, contentCache) {
     if (file.basename.toLowerCase().includes(query))
       return true;
     if (file.path.toLowerCase().includes(query))
@@ -738,57 +1026,54 @@ var KeepView = class extends import_obsidian.ItemView {
     if (!this.isMarkdownFile(file))
       return false;
     try {
-      const content = await this.app.vault.cachedRead(file);
-      const cache = this.app.metadataCache.getFileCache(file);
-      let body = content;
-      if (cache == null ? void 0 : cache.frontmatterPosition) {
-        body = content.substring(cache.frontmatterPosition.end.offset);
-      } else {
-        body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
-      }
+      const content = contentCache ? await this.readCachedWithCache(file, contentCache) : await this.app.vault.cachedRead(file);
+      const body = this.stripFrontmatter(content, file);
       return body.toLowerCase().includes(query);
     } catch (e) {
       return false;
     }
   }
   /** canvasモード専用の混在グリッド描画（配置順）。fileは既存カード、textはタイトルなし＋その場編集 */
-  async renderCanvasCards(items, container) {
+  async renderCanvasCards(items, container, contentCache) {
     const filesOnly = items.every((i) => i.kind === "file");
     if (filesOnly) {
-      await this.renderCards(items.map((i) => i.file), container);
+      await this.renderCards(items.map((i) => i.file), container, contentCache);
       return;
     }
+    const cache = contentCache != null ? contentCache : /* @__PURE__ */ new Map();
     const fragment = document.createDocumentFragment();
+    let sinceYield = 0;
     for (const item of items) {
       if (item.kind === "file") {
-        await this.buildCanvasFileCard(item.file, fragment);
+        await this.buildCanvasFileCard(item.file, fragment, cache);
       } else {
         this.buildCanvasTextCard(item, fragment);
       }
+      if (++sinceYield >= RENDER_YIELD_EVERY) {
+        container.appendChild(fragment);
+        await new Promise((r) => setTimeout(r, 0));
+        sinceYield = 0;
+      }
     }
-    container.appendChild(fragment);
+    if (fragment.childNodes.length > 0)
+      container.appendChild(fragment);
   }
   /** canvasモードのファイルカード1件分（renderCardsのcanvas分岐と同等。split残存／pin・menu・DnDなし） */
-  async buildCanvasFileCard(file, fragment) {
+  async buildCanvasFileCard(file, fragment, contentCache) {
     const isMd = this.isMarkdownFile(file);
     let contentWithoutFrontmatter = "";
     if (isMd) {
       try {
-        const content = await this.app.vault.cachedRead(file);
-        const cache = this.app.metadataCache.getFileCache(file);
-        if (cache == null ? void 0 : cache.frontmatterPosition) {
-          contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
-        } else {
-          contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
-        }
+        const content = contentCache ? await this.readCachedWithCache(file, contentCache) : await this.app.vault.cachedRead(file);
+        contentWithoutFrontmatter = this.stripFrontmatter(content, file).trim();
       } catch (e) {
         contentWithoutFrontmatter = "";
       }
     }
-    const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
     const images = [];
     let match;
     if (isMd) {
+      const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
       while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
         const url = match[1] || match[2];
         if (url)
@@ -850,7 +1135,7 @@ var KeepView = class extends import_obsidian.ItemView {
         return;
       }
       if (isMd) {
-        new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+        this.openNoteModal(file);
       } else {
         const leaf = this.app.workspace.getLeaf("tab");
         void leaf.openFile(file);
@@ -879,9 +1164,15 @@ var KeepView = class extends import_obsidian.ItemView {
     });
   }
   getScratchFolder() {
-    return normalizeScratchFolder(this.scratchFolder);
+    if (this.normalizedScratchSource !== this.scratchFolder) {
+      this.normalizedScratchCache = normalizeScratchFolder(this.scratchFolder);
+      this.normalizedScratchSource = this.scratchFolder;
+    }
+    return this.normalizedScratchCache;
   }
   isScratchFile(f) {
+    if (f.name.endsWith(".masonry-scratch.md"))
+      return true;
     const folder = this.getScratchFolder();
     return folder ? f.path === folder || f.path.startsWith(folder + "/") : false;
   }
@@ -896,15 +1187,20 @@ var KeepView = class extends import_obsidian.ItemView {
     }
     await this.app.vault.createFolder(folder);
   }
+  getSharedScratchPath() {
+    const folder = this.getScratchFolder();
+    return folder ? `${folder}/${_KeepView.SHARED_SCRATCH_NAME}` : _KeepView.SHARED_SCRATCH_NAME;
+  }
   /**
-   * canvasごとの使い回しスクラッチファイルを取得する。なければ作成する。
-   * 毎回の作成・削除は行わない。
+   * 全canvas共有の使い回しスクラッチファイルを取得する。なければ作成する。
+   * 毎回の作成・削除は行わない。canvas名を含めない単一ファイルにすることで、
+   * canvasリネームのたびに別ファイルが増殖する問題を防ぐ。
+   * 編集はモーダル排他のため共有でも競合しない（残存セッションはflushで先に書き戻す）。
    */
-  async getScratchFile(canvasFile) {
+  async getScratchFile() {
     const folder = this.getScratchFolder();
     await this.ensureScratchFolder(folder);
-    const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
-    const path = folder ? `${folder}/${name}` : name;
+    const path = this.getSharedScratchPath();
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof import_obsidian.TFile)
       return existing;
@@ -912,6 +1208,30 @@ var KeepView = class extends import_obsidian.ItemView {
       throw new Error(`Scratch file path is occupied: ${path}`);
     }
     return await this.app.vault.create(path, "");
+  }
+  /**
+   * 旧形式（`<canvas名>.masonry-scratch.md`）の残骸をゴミ箱に移動する。
+   * canvasリネームのたびに増殖した分を回収する。セッション中1回だけ実行。
+   */
+  async cleanupLegacyScratchFiles() {
+    if (_KeepView.legacyScratchCleaned)
+      return;
+    _KeepView.legacyScratchCleaned = true;
+    try {
+      const stale = this.app.vault.getFiles().filter((f) => f.name.endsWith(".masonry-scratch.md") && f.name !== _KeepView.SHARED_SCRATCH_NAME);
+      for (const f of stale) {
+        try {
+          await this.app.fileManager.trashFile(f);
+        } catch (e) {
+          console.warn("Cleanup legacy scratch failed", f.path, e);
+        }
+      }
+      if (stale.length > 0) {
+        new import_obsidian.Notice(`\u53E4\u3044\u30B9\u30AF\u30E9\u30C3\u30C1\u30D5\u30A1\u30A4\u30EB${stale.length}\u4EF6\u3092\u30B4\u30DF\u7BB1\u306B\u79FB\u52D5\u3057\u307E\u3057\u305F`);
+      }
+    } catch (e) {
+      console.warn("Cleanup legacy scratch failed", e);
+    }
   }
   /**
    * テキストノードを通常ファイルと同じ大モーダルで編集する。
@@ -925,7 +1245,7 @@ var KeepView = class extends import_obsidian.ItemView {
         return;
       }
       await this.flushActiveTextSession();
-      const scratch = await this.getScratchFile(canvasFile);
+      const scratch = await this.getScratchFile();
       let current = "";
       try {
         current = await this.app.vault.read(scratch);
@@ -937,9 +1257,13 @@ var KeepView = class extends import_obsidian.ItemView {
       }
       const baseText = item.text;
       this.activeTextSession = { canvasPath: canvasFile.path, nodeId: item.nodeId, baseText };
-      new NoteEditModal(this.app, scratch, this.leaf, () => {
-        void this.onTextModalClose(canvasFile, item.nodeId, baseText);
-      }, "", "", true).open();
+      this.openNoteModal(scratch, {
+        hideTitle: true,
+        renderOnClose: false,
+        onClosed: () => {
+          void this.onTextModalClose(canvasFile, item.nodeId, baseText);
+        }
+      });
     } catch (e) {
       console.error("Open canvas text modal failed", e);
       new import_obsidian.Notice("\u30C6\u30AD\u30B9\u30C8\u306E\u7DE8\u96C6\u3092\u958B\u3051\u307E\u305B\u3093\u3067\u3057\u305F");
@@ -950,10 +1274,7 @@ var KeepView = class extends import_obsidian.ItemView {
     var _a;
     try {
       await new Promise((r) => window.setTimeout(r, 300));
-      const folder = this.getScratchFolder();
-      const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
-      const scratchPath = folder ? `${folder}/${name}` : name;
-      const scratch = this.app.vault.getAbstractFileByPath(scratchPath);
+      const scratch = this.app.vault.getAbstractFileByPath(this.getSharedScratchPath());
       if (scratch instanceof import_obsidian.TFile) {
         let scratchText = "";
         try {
@@ -1002,9 +1323,7 @@ var KeepView = class extends import_obsidian.ItemView {
         this.activeTextSession = null;
         return;
       }
-      const folder = this.getScratchFolder();
-      const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
-      const scratch = this.app.vault.getAbstractFileByPath(folder ? `${folder}/${name}` : name);
+      const scratch = this.app.vault.getAbstractFileByPath(this.getSharedScratchPath());
       if (scratch instanceof import_obsidian.TFile) {
         const scratchText = await this.app.vault.read(scratch);
         await this.writeScratchBackToNode(canvasFile, session.nodeId, session.baseText, scratchText);
@@ -1047,31 +1366,28 @@ var KeepView = class extends import_obsidian.ItemView {
       new import_obsidian.Notice("Canvas\u3078\u306E\u30D5\u30A9\u30FC\u30AB\u30B9\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
     }
   }
-  async renderCards(files, container) {
+  async renderCards(files, container, contentCache) {
     var _a;
     const fragment = document.createDocumentFragment();
     const canvasMode = this.isCanvasMode();
+    let sinceYield = 0;
     for (const file of files) {
       const isMd = this.isMarkdownFile(file);
       let contentWithoutFrontmatter = "";
       let cache = null;
       if (isMd) {
         try {
-          const content = await this.app.vault.cachedRead(file);
+          const content = contentCache ? await this.readCachedWithCache(file, contentCache) : await this.app.vault.cachedRead(file);
           cache = this.app.metadataCache.getFileCache(file);
-          if (cache == null ? void 0 : cache.frontmatterPosition) {
-            contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
-          } else {
-            contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
-          }
+          contentWithoutFrontmatter = this.stripFrontmatter(content, file).trim();
         } catch (e) {
           contentWithoutFrontmatter = "";
         }
       }
-      const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
       const images = [];
       let match;
       if (isMd) {
+        const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
         while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
           const url = match[1] || match[2];
           if (url) {
@@ -1213,7 +1529,7 @@ var KeepView = class extends import_obsidian.ItemView {
           return;
         }
         if (isMd) {
-          new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+          this.openNoteModal(file);
         } else {
           const leaf = this.app.workspace.getLeaf("tab");
           void leaf.openFile(file);
@@ -1241,8 +1557,14 @@ var KeepView = class extends import_obsidian.ItemView {
           menu.showAtMouseEvent(e);
         });
       }
+      if (++sinceYield >= RENDER_YIELD_EVERY) {
+        container.appendChild(fragment);
+        await new Promise((r) => setTimeout(r, 0));
+        sinceYield = 0;
+      }
     }
-    container.appendChild(fragment);
+    if (fragment.childNodes.length > 0)
+      container.appendChild(fragment);
   }
   isImageFile(file) {
     return ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"].includes(file.extension.toLowerCase());
@@ -1541,6 +1863,13 @@ var KeepView = class extends import_obsidian.ItemView {
     await this.revealCanvasFile(canvasFile);
   }
 };
+var KeepView = _KeepView;
+/** アプリ全体で開いている編集モーダルの数。1以上なら背後の再描画を抑止する */
+KeepView.openModalCount = 0;
+/** 全canvas共有の使い回しスクラッチファイル名。canvas名を含めないことでリネーム時の増殖を防ぐ */
+KeepView.SHARED_SCRATCH_NAME = "masonry-scratch.md";
+/** 旧形式(canvas名ベース)の残骸掃除はセッション中1回だけ */
+KeepView.legacyScratchCleaned = false;
 var CanvasPickerModal = class extends import_obsidian.FuzzySuggestModal {
   constructor(app, files, onPick) {
     super(app);
@@ -1850,7 +2179,7 @@ var NoteMasonrySettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.canvasLabelSplitEnabled = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u30C6\u30AD\u30B9\u30C8\u7DE8\u96C6\u7528\u30B9\u30AF\u30E9\u30C3\u30C1\u30D5\u30A9\u30EB\u30C0").setDesc("\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30C6\u30AD\u30B9\u30C8\u30AB\u30FC\u30C9\u3092\u5927\u30E2\u30FC\u30C0\u30EB\u3067\u7DE8\u96C6\u3059\u308B\u305F\u3081\u306E\u4F7F\u3044\u56DE\u3057\u30D5\u30A1\u30A4\u30EB\u306E\u7F6E\u304D\u5834\u6240\uFF08Vault\u76F8\u5BFE\u3001canvas\u3054\u3068\u306B1\u4EF6\u30FB\u81EA\u52D5\u524A\u9664\u306A\u3057\uFF09\u3002\u691C\u7D22\u7B49\u306B\u7D1B\u308C\u306A\u3044\u3088\u3046\u300C\u8A2D\u5B9A\u2192\u30D5\u30A1\u30A4\u30EB\u3068\u30EA\u30F3\u30AF\u2192\u9664\u5916\u30D5\u30A1\u30A4\u30EB\u300D\u3078\u306E\u767B\u9332\u3092\u63A8\u5968\u3057\u307E\u3059\u3002").addText((text) => text.setPlaceholder(DEFAULT_SCRATCH_FOLDER).setValue(this.plugin.settings.scratchFolder).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("\u30C6\u30AD\u30B9\u30C8\u7DE8\u96C6\u7528\u30B9\u30AF\u30E9\u30C3\u30C1\u30D5\u30A9\u30EB\u30C0").setDesc("\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30C6\u30AD\u30B9\u30C8\u30AB\u30FC\u30C9\u3092\u5927\u30E2\u30FC\u30C0\u30EB\u3067\u7DE8\u96C6\u3059\u308B\u305F\u3081\u306E\u4F7F\u3044\u56DE\u3057\u30D5\u30A1\u30A4\u30EB\u306E\u7F6E\u304D\u5834\u6240\uFF08Vault\u76F8\u5BFE\u3001\u5168canvas\u5171\u6709\u30671\u4EF6\u30FB\u81EA\u52D5\u524A\u9664\u306A\u3057\uFF09\u3002\u691C\u7D22\u7B49\u306B\u7D1B\u308C\u306A\u3044\u3088\u3046\u300C\u8A2D\u5B9A\u2192\u30D5\u30A1\u30A4\u30EB\u3068\u30EA\u30F3\u30AF\u2192\u9664\u5916\u30D5\u30A1\u30A4\u30EB\u300D\u3078\u306E\u767B\u9332\u3092\u63A8\u5968\u3057\u307E\u3059\u3002").addText((text) => text.setPlaceholder(DEFAULT_SCRATCH_FOLDER).setValue(this.plugin.settings.scratchFolder).onChange(async (value) => {
       this.plugin.settings.scratchFolder = normalizeScratchFolder(value);
       await this.plugin.saveSettings();
     }));

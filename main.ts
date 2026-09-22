@@ -3,6 +3,11 @@ import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Notice, Plugi
 export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
 const RANDOM_FILE_COUNT = 15;
+/** パフォーマンス調整用定数 */
+const RENDER_INITIAL_LIMIT = 100;
+const RENDER_MORE_STEP = 100;
+const SEARCH_CONTENT_BATCH = 40;
+const RENDER_YIELD_EVERY = 20;
 
 /** canvas絞り込みモードで扱うカード種別。配置順維持のためnodeIndexを保持する */
 interface CanvasFileItem {
@@ -38,12 +43,6 @@ const DEFAULT_SETTINGS: NoteMasonrySettings = {
 function normalizeScratchFolder(raw: string): string {
     const cleaned = (raw ?? '').replace(/\\/g, '/').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
     return cleaned || DEFAULT_SCRATCH_FOLDER;
-}
-
-/** ファイル名に使えない文字を取り除く */
-function sanitizeFileName(raw: string): string {
-    const cleaned = (raw ?? '').replace(/[\/\\:#|?*<>"]/g, '-').trim();
-    return cleaned || 'untitled';
 }
 
 /**
@@ -316,13 +315,36 @@ export class KeepView extends ItemView {
     private createButton: HTMLElement | null = null;
     private canvasBanner: HTMLElement | null = null;
     private isRendering = false;
+    private pendingRender = false;
     private renderTimeout: NodeJS.Timeout | null = null;
     private hasAppliedDefaultTagFilter = false;
     private canvasFocusCycle: Record<string, number> = {};
     /** テキスト編集用スクラッチの格納フォルダ（KeepPluginから注入される） */
     scratchFolder: string = DEFAULT_SCRATCH_FOLDER;
     private activeTextSession: { canvasPath: string; nodeId: string; baseText: string } | null = null;
-    
+    /** ページネーション・キャッシュ用 */
+    private renderLimit = RENDER_INITIAL_LIMIT;
+    private lastFilterKey = '';
+    private displayPinned: TFile[] = [];
+    private displayUnpinned: TFile[] = [];
+    private displayContentCache = new Map<string, string>();
+    private unpinnedGridEl: HTMLElement | null = null;
+    private moreSentinelEl: HTMLElement | null = null;
+    private moreObserver: IntersectionObserver | null = null;
+    private searchWrapperEl: HTMLElement | null = null;
+    private lastFolderPaths: string[] | null = null;
+    private lastTagList: string[] | null = null;
+    private lastFolderValue = '\0';
+    private lastTagValue = '\0';
+    private normalizedScratchCache = DEFAULT_SCRATCH_FOLDER;
+    private normalizedScratchSource: string | null = null;
+    /** アプリ全体で開いている編集モーダルの数。1以上なら背後の再描画を抑止する */
+    private static openModalCount = 0;
+    /** 全canvas共有の使い回しスクラッチファイル名。canvas名を含めないことでリネーム時の増殖を防ぐ */
+    private static readonly SHARED_SCRATCH_NAME = 'masonry-scratch.md';
+    /** 旧形式(canvas名ベース)の残骸掃除はセッション中1回だけ */
+    private static legacyScratchCleaned = false;
+
     selectedFolder: string = '';
     selectedTag: string = '';
     searchQuery: string = '';
@@ -344,6 +366,14 @@ export class KeepView extends ItemView {
 
     getIcon() {
         return "layout-grid";
+    }
+
+    async onClose() {
+        this.disconnectMoreObserver();
+        if (this.renderTimeout) {
+            clearTimeout(this.renderTimeout);
+            this.renderTimeout = null;
+        }
     }
 
     getState() {
@@ -465,21 +495,37 @@ export class KeepView extends ItemView {
         this.createButton = createButton;
         setIcon(createButton, 'plus');
         createButton.addEventListener('click', () => {
-            new NoteEditModal(this.app, null, this.leaf, () => this.requestRender(), this.selectedFolder, this.selectedTag).open();
+            this.openNoteModal(null, { selectedFolder: this.selectedFolder, selectedTag: this.selectedTag });
         });
 
         this.canvasBanner = container.createEl('div', { cls: 'keep-canvas-banner' });
         this.canvasBanner.hide();
     
         this.gridContainer = container.createEl('div', { cls: 'keep-grid-wrapper' });
+        this.searchWrapperEl = searchWrapper;
 
-        this.registerEvent(this.app.vault.on('create', () => this.requestRender()));
-        this.registerEvent(this.app.vault.on('modify', () => this.requestRender()));
-        this.registerEvent(this.app.vault.on('delete', () => this.requestRender()));
-        this.registerEvent(this.app.vault.on('rename', () => this.requestRender()));
-        this.registerEvent(this.app.metadataCache.on('changed', () => this.requestRender()));
+        // スクラッチファイルの変更では再描画しない。高頻度のmodify/changedは長めにデバウンスする。
+        this.registerEvent(this.app.vault.on('create', (f) => {
+            if (f instanceof TFile && this.isScratchFile(f)) return;
+            this.requestRender(300);
+        }));
+        this.registerEvent(this.app.vault.on('modify', (f) => {
+            if (f instanceof TFile && this.isScratchFile(f)) return;
+            if (f instanceof TFile && f.extension === 'canvas' && !this.isCanvasMode()) return;
+            this.requestRender(600);
+        }));
+        this.registerEvent(this.app.vault.on('delete', (f) => {
+            if (f instanceof TFile && this.isScratchFile(f)) return;
+            this.requestRender(300);
+        }));
+        this.registerEvent(this.app.vault.on('rename', () => this.requestRender(300)));
+        this.registerEvent(this.app.metadataCache.on('changed', (f) => {
+            if (f instanceof TFile && this.isScratchFile(f)) return;
+            this.requestRender(600);
+        }));
 
         this.updateCanvasModeUI();
+        void this.cleanupLegacyScratchFiles();
         await this.renderGrid();
     }
 
@@ -585,7 +631,8 @@ export class KeepView extends ItemView {
     }
 
     updateSearchVisibility() {
-      const searchWrapper = this.containerEl.querySelector('.keep-search-wrapper') as HTMLElement;
+      const searchWrapper = this.searchWrapperEl ?? (this.containerEl.querySelector('.keep-search-wrapper') as HTMLElement | null);
+      if (!this.searchWrapperEl && searchWrapper) this.searchWrapperEl = searchWrapper;
       if (searchWrapper) {
           if (this.searchQuery) {
               searchWrapper.addClass('has-value');
@@ -594,14 +641,49 @@ export class KeepView extends ItemView {
           }
       }
     }
-    
-    requestRender() {
+
+    /**
+     * 編集モーダルを開く共通ヘルパー。開いている間は requestRender を抑止して
+     * 背後のカードViewが編集中にちらつかないようにし、閉じた後に1回だけ再描画する。
+     */
+    private openNoteModal(
+        file: TFile | null,
+        opts: { selectedFolder?: string; selectedTag?: string; hideTitle?: boolean; renderOnClose?: boolean; onClosed?: () => void } = {},
+    ) {
+        KeepView.openModalCount++;
+        let closed = false;
+        const doClose = () => {
+            if (closed) return;
+            closed = true;
+            KeepView.openModalCount = Math.max(0, KeepView.openModalCount - 1);
+            try {
+                opts.onClosed?.();
+            } finally {
+                if (opts.renderOnClose !== false) this.requestRender();
+            }
+        };
+        try {
+            new NoteEditModal(this.app, file, this.leaf, doClose, opts.selectedFolder ?? '', opts.selectedTag ?? '', opts.hideTitle ?? false).open();
+        } catch (e) {
+            doClose();
+            throw e;
+        }
+    }
+
+    requestRender(delay = 300) {
+        // 編集モーダルを開いている間は背後への反映を抑止し、閉じた後の1回にまとめる
+        if (KeepView.openModalCount > 0) return;
         if (this.renderTimeout) {
             clearTimeout(this.renderTimeout);
         }
         this.renderTimeout = setTimeout(() => {
+            this.renderTimeout = null;
+            if (this.isRendering) {
+                this.pendingRender = true;
+                return;
+            }
             void this.renderGrid();
-        }, 300);
+        }, delay);
     }
 
     applyDefaultTagFilter() {
@@ -646,12 +728,22 @@ export class KeepView extends ItemView {
         }
     }
 
+    private isSameStringArray(a: string[] | null, b: string[]): boolean {
+        if (!a || a.length !== b.length) return false;
+        for (let i = 0; i < b.length; i++) {
+            if (a[i] !== b[i]) return false;
+        }
+        return true;
+    }
+
     updateFilterUI() {
         const folders = this.app.vault.getAllLoadedFiles().filter((f): f is TFolder => f instanceof TFolder);
         // @ts-ignore
         const tags: string[] = Object.keys(this.app.metadataCache.getTags()).sort();
 
-        if (this.folderSelect.options.length !== folders.length + 1) {
+        // 一覧の中身が変わったときだけoptionを作り直す（毎renderでのDOM再構築と強制レイアウトを避ける）
+        const folderPaths = folders.map((f) => f.path);
+        if (!this.isSameStringArray(this.lastFolderPaths, folderPaths) || this.folderSelect.options.length !== folders.length + 1) {
             const currentFolder = this.selectedFolder;
             this.folderSelect.empty();
             this.folderSelect.createEl('option', { value: '', text: 'All folders' });
@@ -660,9 +752,11 @@ export class KeepView extends ItemView {
                 const option = this.folderSelect.createEl('option', { value: f.path, text: f.path });
                 if (f.path === currentFolder) option.selected = true;
             });
+            this.lastFolderPaths = folderPaths;
+            this.lastFolderValue = '\0';
         }
 
-        if (this.tagSelect.options.length !== tags.length + 1) {
+        if (!this.isSameStringArray(this.lastTagList, tags) || this.tagSelect.options.length !== tags.length + 1) {
             const currentTag = this.selectedTag;
             this.tagSelect.empty();
             this.tagSelect.createEl('option', { value: '', text: 'All tags' });
@@ -670,42 +764,144 @@ export class KeepView extends ItemView {
                 const option = this.tagSelect.createEl('option', { value: t, text: t });
                 if (t === currentTag) option.selected = true;
             });
+            this.lastTagList = tags.slice();
+            this.lastTagValue = '\0';
         }
-      
-        this.folderSelect.value = this.selectedFolder;
-        this.adjustSelectWidth(this.folderSelect);
-        
-        this.tagSelect.value = this.selectedTag;
-        this.adjustSelectWidth(this.tagSelect);
+
+        if (this.folderSelect.value !== this.selectedFolder) {
+            this.folderSelect.value = this.selectedFolder;
+        }
+        if (this.lastFolderValue !== this.selectedFolder) {
+            this.adjustSelectWidth(this.folderSelect);
+            this.lastFolderValue = this.selectedFolder;
+        }
+
+        if (this.tagSelect.value !== this.selectedTag) {
+            this.tagSelect.value = this.selectedTag;
+        }
+        if (this.lastTagValue !== this.selectedTag) {
+            this.adjustSelectWidth(this.tagSelect);
+            this.lastTagValue = this.selectedTag;
+        }
     }
 
     adjustSelectWidth(select: HTMLSelectElement) {
         if (!select || select.options.length === 0) return;
-        
+        const selected = select.options[select.selectedIndex];
+        if (!selected) return;
+        // 同じ表示名なら再計測しない（getBoundingClientRectの強制レイアウトを削減）
+        const cacheKey = selected.text;
+        if ((select as HTMLSelectElement & { dataset: DOMStringMap }).dataset.lastWidthFor === cacheKey) return;
+
         const tempSpan = document.createElement('span');
         tempSpan.setCssProps({
             'visibility': 'hidden',
             'position': 'absolute',
             'white-space': 'nowrap',
         });
-        
+
         const computedStyle = window.getComputedStyle(select);
         tempSpan.setCssProps({
             'font-size': computedStyle.fontSize,
             'font-family': computedStyle.fontFamily,
         });
-        
-        tempSpan.innerText = select.options[select.selectedIndex].text;
+
+        tempSpan.innerText = cacheKey;
         document.body.appendChild(tempSpan);
-        
+
         const textWidth = tempSpan.getBoundingClientRect().width;
         document.body.removeChild(tempSpan);
-        
+
         select.style.width = `${textWidth + 20}px`;
+        (select as HTMLSelectElement & { dataset: DOMStringMap }).dataset.lastWidthFor = cacheKey;
     }
   
+    /** フィルタ条件のキー。変わったときだけページネーションをリセットする */
+    private getFilterKey(): string {
+        return `${this.selectedFolder}\n${this.selectedTag}\n${this.searchQuery}\n${this.isRandomMode ? 'R' : ''}\n${this.canvasSourcePath ?? ''}`;
+    }
+
+    /** frontmatterを除いた本文を取り出す（検索・スニペット共通） */
+    private stripFrontmatter(content: string, file: TFile): string {
+        try {
+            const cache = this.app.metadataCache.getFileCache(file);
+            if (cache?.frontmatterPosition) {
+                return content.substring(cache.frontmatterPosition.end.offset);
+            }
+        } catch {
+            // ignore
+        }
+        if (content.charCodeAt(0) === 45 && content.startsWith('---')) {
+            return content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+        }
+        return content;
+    }
+
+    private async readCachedWithCache(file: TFile, cache: Map<string, string>): Promise<string> {
+        const hit = cache.get(file.path);
+        if (hit !== undefined) return hit;
+        const content = await this.app.vault.cachedRead(file);
+        // メモリ肥大防止のため上限を設ける
+        if (cache.size > 500) {
+            const first = cache.keys().next();
+            if (!first.done) cache.delete(first.value);
+        }
+        cache.set(file.path, content);
+        return content;
+    }
+
+    /**
+     * 本文検索。basename一致を先に確定させ、残りだけ本文読み＋バッチ処理する。
+     * 読み込んだ本文はcontentCacheに残し、カード描画での二重読みを避ける。
+     */
+    private async filterBySearchQuery(files: TFile[], query: string, contentCache: Map<string, string>): Promise<TFile[]> {
+        const matched: TFile[] = [];
+        const needContent: TFile[] = [];
+        const matchedPaths = new Set<string>();
+        for (const f of files) {
+            if (f.basename.toLowerCase().includes(query) || f.path.toLowerCase().includes(query)) {
+                matched.push(f);
+                matchedPaths.add(f.path);
+            } else {
+                needContent.push(f);
+            }
+        }
+        if (needContent.length === 0) return matched;
+        const contentMatched: TFile[] = [];
+        for (let i = 0; i < needContent.length; i += SEARCH_CONTENT_BATCH) {
+            const slice = needContent.slice(i, i + SEARCH_CONTENT_BATCH);
+            const results = await Promise.all(slice.map(async (f) => {
+                try {
+                    const content = await this.readCachedWithCache(f, contentCache);
+                    const body = this.stripFrontmatter(content, f);
+                    return body.toLowerCase().includes(query);
+                } catch {
+                    return false;
+                }
+            }));
+            for (let j = 0; j < slice.length; j++) {
+                if (results[j]) contentMatched.push(slice[j]);
+            }
+            // 大量ファイル時にUIを固めないよう1バッチごとに譲る
+            if (i + SEARCH_CONTENT_BATCH < needContent.length) {
+                await new Promise((r) => setTimeout(r, 0));
+            }
+        }
+        // mtime順を保つため元の順序で結合し直す
+        if (contentMatched.length === 0) return matched;
+        const contentSet = new Set(contentMatched.map((f) => f.path));
+        const out: TFile[] = [];
+        for (const f of files) {
+            if (matchedPaths.has(f.path) || contentSet.has(f.path)) out.push(f);
+        }
+        return out;
+    }
+
     async renderGrid() {
-        if (this.isRendering) return;
+        if (this.isRendering) {
+            this.pendingRender = true;
+            return;
+        }
         this.isRendering = true;
 
         try {
@@ -718,48 +914,39 @@ export class KeepView extends ItemView {
             this.updateFilterUI();
             this.updateRandomButtonState();
 
+            const filterKey = this.getFilterKey();
+            if (filterKey !== this.lastFilterKey) {
+                this.renderLimit = RENDER_INITIAL_LIMIT;
+                this.lastFilterKey = filterKey;
+            }
+
             let files: TFile[];
+            const contentCache = new Map<string, string>();
 
             if (this.isRandomMode) {
-                const existingPaths = new Set(this.app.vault.getMarkdownFiles().map(f => f.path));
+                const allMarkdown = this.app.vault.getMarkdownFiles();
+                const existingPaths = new Set(allMarkdown.map(f => f.path));
                 files = this.randomFiles.filter(f => existingPaths.has(f.path) && !this.isScratchFile(f));
             } else {
                 let filtered = this.app.vault.getMarkdownFiles().filter((f) => !this.isScratchFile(f));
-                
+
                 if (this.selectedFolder) {
-                    filtered = filtered.filter(f => f.parent?.path === this.selectedFolder || f.parent?.path.startsWith(this.selectedFolder + '/'));
+                    const prefix = this.selectedFolder + '/';
+                    filtered = filtered.filter(f => f.parent?.path === this.selectedFolder || f.parent?.path.startsWith(prefix));
                 }
-                
+
                 if (this.selectedTag) {
+                    const tag = this.selectedTag;
                     filtered = filtered.filter(f => {
                         const cache = this.app.metadataCache.getFileCache(f);
                         const tags = cache ? getAllTags(cache) || [] : [];
-                        return tags.includes(this.selectedTag);
+                        return tags.includes(tag);
                     });
                 }
 
                 if (this.searchQuery) {
                     const query = this.searchQuery.toLowerCase();
-                    const searchPromises = filtered.map(async (f) => {
-                        const content = await this.app.vault.cachedRead(f);
-                        const cache = this.app.metadataCache.getFileCache(f);
-                        
-                        if (f.basename.toLowerCase().includes(query)) {
-                            return true;
-                        }
-                        
-                        let contentWithoutFrontmatter = content;
-                        if (cache?.frontmatterPosition) {
-                            contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset);
-                        } else {
-                            contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
-                        }
-                        
-                        return contentWithoutFrontmatter.toLowerCase().includes(query);
-                    });
-                    
-                    const searchResults = await Promise.all(searchPromises);
-                    filtered = filtered.filter((_, index) => searchResults[index]);
+                    filtered = await this.filterBySearchQuery(filtered, query, contentCache);
                 }
 
                 files = filtered;
@@ -777,23 +964,104 @@ export class KeepView extends ItemView {
                 else unpinnedFiles.push(file);
             }
 
+            this.displayPinned = pinnedFiles;
+            this.displayUnpinned = unpinnedFiles;
+            this.displayContentCache = contentCache;
+
+            this.disconnectMoreObserver();
             this.gridContainer.empty();
+            this.unpinnedGridEl = null;
+            this.moreSentinelEl = null;
 
             if (pinnedFiles.length > 0) {
                 this.gridContainer.createEl('h3', { text: 'Pinned', cls: 'keep-section-title' });
                 const pinnedGrid = this.gridContainer.createEl('div', { cls: 'keep-grid' });
-                await this.renderCards(pinnedFiles, pinnedGrid);
-                
+                await this.renderCards(pinnedFiles, pinnedGrid, contentCache);
+
                 if (unpinnedFiles.length > 0) {
                     this.gridContainer.createEl('h3', { text: 'Others', cls: 'keep-section-title keep-section-title-others' });
                 }
             }
 
             const unpinnedGrid = this.gridContainer.createEl('div', { cls: 'keep-grid' });
-            await this.renderCards(unpinnedFiles, unpinnedGrid);
+            this.unpinnedGridEl = unpinnedGrid;
+            const visible = unpinnedFiles.slice(0, Math.max(0, this.renderLimit - pinnedFiles.length));
+            await this.renderCards(visible, unpinnedGrid, contentCache);
+            this.setupMoreUI(unpinnedFiles.length, visible.length);
 
         } finally {
             this.isRendering = false;
+            if (this.pendingRender) {
+                this.pendingRender = false;
+                this.requestRender(100);
+            }
+        }
+    }
+
+    private disconnectMoreObserver() {
+        if (this.moreObserver) {
+            try { this.moreObserver.disconnect(); } catch { /* ignore */ }
+            this.moreObserver = null;
+        }
+    }
+
+    /** 残り件数表示＋自動追加（IntersectionObserver）で初回描画を軽く保つ */
+    private setupMoreUI(total: number, rendered: number) {
+        const rest = total - rendered;
+        if (rest <= 0) return;
+        const moreWrap = this.gridContainer.createEl('div', { cls: 'keep-more-wrap' });
+        const btn = moreWrap.createEl('button', {
+            cls: 'keep-more-button',
+            text: `さらに表示 (${rendered}/${total})`,
+        });
+        btn.addEventListener('click', () => void this.renderMore());
+        this.moreSentinelEl = moreWrap;
+        try {
+            this.moreObserver = new IntersectionObserver((entries) => {
+                for (const e of entries) {
+                    if (e.isIntersecting) {
+                        void this.renderMore();
+                        break;
+                    }
+                }
+            }, { rootMargin: '600px' });
+            this.moreObserver.observe(moreWrap);
+        } catch {
+            // Observer非対応環境ではボタンクリックのみ
+        }
+    }
+
+    private async renderMore() {
+        if (this.isRendering) return;
+        if (!this.unpinnedGridEl || !this.moreSentinelEl) return;
+        const total = this.displayUnpinned.length;
+        const rendered = this.unpinnedGridEl.children.length;
+        if (rendered >= total) {
+            this.moreSentinelEl.remove();
+            this.moreSentinelEl = null;
+            this.disconnectMoreObserver();
+            return;
+        }
+        this.isRendering = true;
+        try {
+            this.renderLimit += RENDER_MORE_STEP;
+            const next = this.displayUnpinned.slice(rendered, rendered + RENDER_MORE_STEP);
+            await this.renderCards(next, this.unpinnedGridEl, this.displayContentCache);
+            const now = this.unpinnedGridEl.children.length;
+            if (now >= total) {
+                this.moreSentinelEl.remove();
+                this.moreSentinelEl = null;
+                this.disconnectMoreObserver();
+            } else {
+                const btn = this.moreSentinelEl.querySelector('.keep-more-button') as HTMLElement | null;
+                if (btn) btn.setText(`さらに表示 (${now}/${total})`);
+            }
+        } finally {
+            this.isRendering = false;
+            if (this.pendingRender) {
+                this.pendingRender = false;
+                this.requestRender(100);
+            }
         }
     }
 
@@ -811,14 +1079,25 @@ export class KeepView extends ItemView {
             return;
         }
         let items = await this.loadCanvasGridItems(canvasFile);
+        const canvasContentCache = new Map<string, string>();
 
         if (this.searchQuery) {
             const query = this.searchQuery.toLowerCase();
-            const results = await Promise.all(items.map((item) => {
-                if (item.kind === 'file') return this.matchesCanvasSearch(item.file, query);
-                return Promise.resolve(item.text.toLowerCase().includes(query));
-            }));
-            items = items.filter((_, i) => results[i]);
+            const out: CanvasGridItem[] = [];
+            for (let i = 0; i < items.length; i += SEARCH_CONTENT_BATCH) {
+                const slice = items.slice(i, i + SEARCH_CONTENT_BATCH);
+                const results = await Promise.all(slice.map((item) => {
+                    if (item.kind === 'file') return this.matchesCanvasSearch(item.file, query, canvasContentCache);
+                    return Promise.resolve(item.text.toLowerCase().includes(query));
+                }));
+                for (let j = 0; j < slice.length; j++) {
+                    if (results[j]) out.push(slice[j]);
+                }
+                if (i + SEARCH_CONTENT_BATCH < items.length) {
+                    await new Promise((r) => setTimeout(r, 0));
+                }
+            }
+            items = out;
         }
 
         if (items.length === 0) {
@@ -829,22 +1108,18 @@ export class KeepView extends ItemView {
             return;
         }
         const grid = this.gridContainer.createEl('div', { cls: 'keep-grid' });
-        await this.renderCanvasCards(items, grid);
+        await this.renderCanvasCards(items, grid, canvasContentCache);
     }
 
-    private async matchesCanvasSearch(file: TFile, query: string): Promise<boolean> {
+    private async matchesCanvasSearch(file: TFile, query: string, contentCache?: Map<string, string>): Promise<boolean> {
         if (file.basename.toLowerCase().includes(query)) return true;
         if (file.path.toLowerCase().includes(query)) return true;
         if (!this.isMarkdownFile(file)) return false;
         try {
-            const content = await this.app.vault.cachedRead(file);
-            const cache = this.app.metadataCache.getFileCache(file);
-            let body = content;
-            if (cache?.frontmatterPosition) {
-                body = content.substring(cache.frontmatterPosition.end.offset);
-            } else {
-                body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
-            }
+            const content = contentCache
+                ? await this.readCachedWithCache(file, contentCache)
+                : await this.app.vault.cachedRead(file);
+            const body = this.stripFrontmatter(content, file);
             return body.toLowerCase().includes(query);
         } catch {
             return false;
@@ -852,44 +1127,48 @@ export class KeepView extends ItemView {
     }
 
     /** canvasモード専用の混在グリッド描画（配置順）。fileは既存カード、textはタイトルなし＋その場編集 */
-    private async renderCanvasCards(items: CanvasGridItem[], container: HTMLElement) {
+    private async renderCanvasCards(items: CanvasGridItem[], container: HTMLElement, contentCache?: Map<string, string>) {
         const filesOnly = items.every((i) => i.kind === 'file');
         if (filesOnly) {
-            await this.renderCards(items.map((i) => (i as CanvasFileItem).file), container);
+            await this.renderCards(items.map((i) => (i as CanvasFileItem).file), container, contentCache);
             return;
         }
+        const cache = contentCache ?? new Map<string, string>();
         const fragment = document.createDocumentFragment();
+        let sinceYield = 0;
         for (const item of items) {
             if (item.kind === 'file') {
-                await this.buildCanvasFileCard(item.file, fragment);
+                await this.buildCanvasFileCard(item.file, fragment, cache);
             } else {
                 this.buildCanvasTextCard(item, fragment);
             }
+            if (++sinceYield >= RENDER_YIELD_EVERY) {
+                container.appendChild(fragment);
+                await new Promise((r) => setTimeout(r, 0));
+                sinceYield = 0;
+            }
         }
-        container.appendChild(fragment);
+        if (fragment.childNodes.length > 0) container.appendChild(fragment);
     }
 
     /** canvasモードのファイルカード1件分（renderCardsのcanvas分岐と同等。split残存／pin・menu・DnDなし） */
-    private async buildCanvasFileCard(file: TFile, fragment: DocumentFragment) {
+    private async buildCanvasFileCard(file: TFile, fragment: DocumentFragment, contentCache?: Map<string, string>) {
         const isMd = this.isMarkdownFile(file);
         let contentWithoutFrontmatter = '';
         if (isMd) {
             try {
-                const content = await this.app.vault.cachedRead(file);
-                const cache = this.app.metadataCache.getFileCache(file);
-                if (cache?.frontmatterPosition) {
-                    contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
-                } else {
-                    contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
-                }
+                const content = contentCache
+                    ? await this.readCachedWithCache(file, contentCache)
+                    : await this.app.vault.cachedRead(file);
+                contentWithoutFrontmatter = this.stripFrontmatter(content, file).trim();
             } catch {
                 contentWithoutFrontmatter = '';
             }
         }
-        const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
         const images: string[] = [];
         let match;
         if (isMd) {
+            const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
             while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
                 const url = match[1] || match[2];
                 if (url) images.push(url);
@@ -955,7 +1234,7 @@ export class KeepView extends ItemView {
                 return;
             }
             if (isMd) {
-                new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+                this.openNoteModal(file);
             } else {
                 const leaf = this.app.workspace.getLeaf('tab');
                 void leaf.openFile(file);
@@ -986,10 +1265,16 @@ export class KeepView extends ItemView {
     }
 
     private getScratchFolder(): string {
-        return normalizeScratchFolder(this.scratchFolder);
+        if (this.normalizedScratchSource !== this.scratchFolder) {
+            this.normalizedScratchCache = normalizeScratchFolder(this.scratchFolder);
+            this.normalizedScratchSource = this.scratchFolder;
+        }
+        return this.normalizedScratchCache;
     }
 
     private isScratchFile(f: TFile): boolean {
+        // 旧形式の残骸が別フォルダにあってもカード一覧に紛れ込ませない
+        if (f.name.endsWith('.masonry-scratch.md')) return true;
         const folder = this.getScratchFolder();
         return folder ? f.path === folder || f.path.startsWith(folder + '/') : false;
     }
@@ -1004,21 +1289,52 @@ export class KeepView extends ItemView {
         await this.app.vault.createFolder(folder);
     }
 
+    private getSharedScratchPath(): string {
+        const folder = this.getScratchFolder();
+        return folder ? `${folder}/${KeepView.SHARED_SCRATCH_NAME}` : KeepView.SHARED_SCRATCH_NAME;
+    }
+
     /**
-     * canvasごとの使い回しスクラッチファイルを取得する。なければ作成する。
-     * 毎回の作成・削除は行わない。
+     * 全canvas共有の使い回しスクラッチファイルを取得する。なければ作成する。
+     * 毎回の作成・削除は行わない。canvas名を含めない単一ファイルにすることで、
+     * canvasリネームのたびに別ファイルが増殖する問題を防ぐ。
+     * 編集はモーダル排他のため共有でも競合しない（残存セッションはflushで先に書き戻す）。
      */
-    private async getScratchFile(canvasFile: TFile): Promise<TFile> {
+    private async getScratchFile(): Promise<TFile> {
         const folder = this.getScratchFolder();
         await this.ensureScratchFolder(folder);
-        const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
-        const path = folder ? `${folder}/${name}` : name;
+        const path = this.getSharedScratchPath();
         const existing = this.app.vault.getAbstractFileByPath(path);
         if (existing instanceof TFile) return existing;
         if (existing) {
             throw new Error(`Scratch file path is occupied: ${path}`);
         }
         return await this.app.vault.create(path, '');
+    }
+
+    /**
+     * 旧形式（`<canvas名>.masonry-scratch.md`）の残骸をゴミ箱に移動する。
+     * canvasリネームのたびに増殖した分を回収する。セッション中1回だけ実行。
+     */
+    private async cleanupLegacyScratchFiles(): Promise<void> {
+        if (KeepView.legacyScratchCleaned) return;
+        KeepView.legacyScratchCleaned = true;
+        try {
+            const stale = this.app.vault.getFiles().filter((f) =>
+                f.name.endsWith('.masonry-scratch.md') && f.name !== KeepView.SHARED_SCRATCH_NAME);
+            for (const f of stale) {
+                try {
+                    await this.app.fileManager.trashFile(f);
+                } catch (e) {
+                    console.warn('Cleanup legacy scratch failed', f.path, e);
+                }
+            }
+            if (stale.length > 0) {
+                new Notice(`古いスクラッチファイル${stale.length}件をゴミ箱に移動しました`);
+            }
+        } catch (e) {
+            console.warn('Cleanup legacy scratch failed', e);
+        }
     }
 
     /**
@@ -1033,7 +1349,7 @@ export class KeepView extends ItemView {
                 return;
             }
             await this.flushActiveTextSession();
-            const scratch = await this.getScratchFile(canvasFile);
+            const scratch = await this.getScratchFile();
             let current = '';
             try {
                 current = await this.app.vault.read(scratch);
@@ -1045,9 +1361,14 @@ export class KeepView extends ItemView {
             }
             const baseText = item.text;
             this.activeTextSession = { canvasPath: canvasFile.path, nodeId: item.nodeId, baseText };
-            new NoteEditModal(this.app, scratch, this.leaf, () => {
-                void this.onTextModalClose(canvasFile, item.nodeId, baseText);
-            }, '', '', true).open();
+            // 書き戻し側(onTextModalClose)のfinallyで再描画するため、ここではrenderOnCloseを抑える
+            this.openNoteModal(scratch, {
+                hideTitle: true,
+                renderOnClose: false,
+                onClosed: () => {
+                    void this.onTextModalClose(canvasFile, item.nodeId, baseText);
+                },
+            });
         } catch (e) {
             console.error('Open canvas text modal failed', e);
             new Notice('テキストの編集を開けませんでした');
@@ -1059,10 +1380,7 @@ export class KeepView extends ItemView {
         try {
             // エディタの自動保存フラッシュを待つ
             await new Promise((r) => window.setTimeout(r, 300));
-            const folder = this.getScratchFolder();
-            const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
-            const scratchPath = folder ? `${folder}/${name}` : name;
-            const scratch = this.app.vault.getAbstractFileByPath(scratchPath);
+            const scratch = this.app.vault.getAbstractFileByPath(this.getSharedScratchPath());
             if (scratch instanceof TFile) {
                 let scratchText = '';
                 try {
@@ -1109,9 +1427,7 @@ export class KeepView extends ItemView {
                 this.activeTextSession = null;
                 return;
             }
-            const folder = this.getScratchFolder();
-            const name = `${sanitizeFileName(canvasFile.basename)}.masonry-scratch.md`;
-            const scratch = this.app.vault.getAbstractFileByPath(folder ? `${folder}/${name}` : name);
+            const scratch = this.app.vault.getAbstractFileByPath(this.getSharedScratchPath());
             if (scratch instanceof TFile) {
                 const scratchText = await this.app.vault.read(scratch);
                 await this.writeScratchBackToNode(canvasFile, session.nodeId, session.baseText, scratchText);
@@ -1155,31 +1471,30 @@ export class KeepView extends ItemView {
         }
     }
 
-    async renderCards(files: TFile[], container: HTMLElement) {
+    async renderCards(files: TFile[], container: HTMLElement, contentCache?: Map<string, string>) {
         const fragment = document.createDocumentFragment();
         const canvasMode = this.isCanvasMode();
+        let sinceYield = 0;
         for (const file of files) {
             const isMd = this.isMarkdownFile(file);
             let contentWithoutFrontmatter = '';
             let cache: ReturnType<App['metadataCache']['getFileCache']> = null;
             if (isMd) {
                 try {
-                    const content = await this.app.vault.cachedRead(file);
+                    const content = contentCache
+                        ? await this.readCachedWithCache(file, contentCache)
+                        : await this.app.vault.cachedRead(file);
                     cache = this.app.metadataCache.getFileCache(file);
-                    if (cache?.frontmatterPosition) {
-                        contentWithoutFrontmatter = content.substring(cache.frontmatterPosition.end.offset).trim();
-                    } else {
-                        contentWithoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
-                    }
+                    contentWithoutFrontmatter = this.stripFrontmatter(content, file).trim();
                 } catch {
                     contentWithoutFrontmatter = '';
                 }
             }
 
-            const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
             const images: string[] = [];
             let match;
             if (isMd) {
+                const imageRegex = /!\[.*?\]\((.*?)\)|!\[\[(.*?)\]\]/g;
                 while ((match = imageRegex.exec(contentWithoutFrontmatter)) !== null && images.length < 2) {
                     const url = match[1] || match[2];
                     if (url) {
@@ -1349,7 +1664,7 @@ export class KeepView extends ItemView {
                     return;
                 }
                 if (isMd) {
-                    new NoteEditModal(this.app, file, this.leaf, () => this.requestRender()).open();
+                    this.openNoteModal(file);
                 } else {
                     const leaf = this.app.workspace.getLeaf('tab');
                     void leaf.openFile(file);
@@ -1384,8 +1699,14 @@ export class KeepView extends ItemView {
                     menu.showAtMouseEvent(e);
                 });
             }
+            // 大量カード時にUIスレッドを占有しないよう、一定件数ごとにDOM反映＋譲る
+            if (++sinceYield >= RENDER_YIELD_EVERY) {
+                container.appendChild(fragment);
+                await new Promise((r) => setTimeout(r, 0));
+                sinceYield = 0;
+            }
         }
-        container.appendChild(fragment);
+        if (fragment.childNodes.length > 0) container.appendChild(fragment);
     }
 
     private isImageFile(file: TFile): boolean {
@@ -2023,7 +2344,7 @@ class NoteMasonrySettingTab extends PluginSettingTab {
                 }));
         new Setting(containerEl)
             .setName('テキスト編集用スクラッチフォルダ')
-            .setDesc('キャンバス内のテキストカードを大モーダルで編集するための使い回しファイルの置き場所（Vault相対、canvasごとに1件・自動削除なし）。検索等に紛れないよう「設定→ファイルとリンク→除外ファイル」への登録を推奨します。')
+            .setDesc('キャンバス内のテキストカードを大モーダルで編集するための使い回しファイルの置き場所（Vault相対、全canvas共有で1件・自動削除なし）。検索等に紛れないよう「設定→ファイルとリンク→除外ファイル」への登録を推奨します。')
             .addText((text) => text
                 .setPlaceholder(DEFAULT_SCRATCH_FOLDER)
                 .setValue(this.plugin.settings.scratchFolder)

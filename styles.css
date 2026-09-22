@@ -468,6 +468,28 @@ body.note-masonry-canvas-label-split .canvas-node-label {
     font-size: 0.9em;
 }
 
+.keep-more-wrap {
+    display: flex;
+    justify-content: center;
+    padding: 12px 0 24px;
+    break-inside: avoid;
+}
+
+.keep-more-button {
+    padding: 6px 16px;
+    border-radius: 20px;
+    border: 1px solid var(--background-modifier-border);
+    background-color: var(--background-secondary);
+    color: var(--text-muted);
+    font-size: 0.85em;
+    cursor: pointer;
+}
+
+.keep-more-button:hover {
+    background-color: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
 .keep-text-card {
     border-style: dashed;
 }
