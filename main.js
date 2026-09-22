@@ -677,20 +677,6 @@ var KeepView = class extends import_obsidian.ItemView {
         });
         menu.showAtMouseEvent(e);
       });
-      const canvasBtn = card.createEl("button", {
-        cls: "keep-canvas-btn",
-        attr: { "aria-label": "Send to Canvas" }
-      });
-      (0, import_obsidian.setIcon)(canvasBtn, "layout-dashboard");
-      const canvasSvg = canvasBtn.querySelector("svg");
-      if (canvasSvg) {
-        canvasSvg.setAttribute("fill", "none");
-        canvasSvg.setAttribute("stroke", "currentColor");
-      }
-      canvasBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void this.sendFileToCanvas(file);
-      });
       if (file.basename) {
         card.createEl("h3", { text: file.basename, cls: "keep-card-title" });
       }

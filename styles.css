@@ -265,40 +265,6 @@
     opacity: 1;
 }
 
-.keep-card .keep-canvas-btn {
-    position: absolute;
-    top: 8px;
-    right: 68px;
-    background: transparent;
-    border: none;
-    outline: none;
-    box-shadow: none;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.2s ease, color 0.2s ease, background-color 0.2s ease;
-    color: var(--color-base-40);
-    padding: 5px 6px 6px 6px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 50%;
-}
-
-.keep-card .keep-canvas-btn:focus-visible,
-.keep-card .keep-canvas-btn:focus {
-    outline: none;
-    box-shadow: none;
-}
-
-.keep-card .keep-canvas-btn:hover {
-  background-color: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
-.keep-card:hover .keep-canvas-btn {
-    opacity: 1;
-}
-
 .keep-card.is-dragging {
     opacity: 0.5;
 }
