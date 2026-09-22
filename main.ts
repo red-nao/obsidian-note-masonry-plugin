@@ -1,8 +1,16 @@
-import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Notice, Plugin, Scope, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
+import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Notice, Plugin, PluginSettingTab, Scope, Setting, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
 
 export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
 const RANDOM_FILE_COUNT = 15;
+
+interface NoteMasonrySettings {
+    canvasLabelSplitEnabled: boolean;
+}
+
+const DEFAULT_SETTINGS: NoteMasonrySettings = {
+    canvasLabelSplitEnabled: true,
+};
 
 /**
  * Obsidian標準の Modal はキーボードイベント処理を横取りするため、
@@ -1021,9 +1029,125 @@ class CanvasPickerModal extends FuzzySuggestModal<TFile> {
 }
 
 export default class KeepPlugin extends Plugin {
-    onload() {
+    settings: NoteMasonrySettings = { ...DEFAULT_SETTINGS };
+
+    async onload() {
+        await this.loadSettings();
         this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
         this.addRibbonIcon('layout-grid', 'Open note masonry', () => void this.activateView());
+        this.addSettingTab(new NoteMasonrySettingTab(this.app, this));
+        // Canvasコアは .canvas-node-label の click を Mod付きのときのみ開く
+        // (素のクリックは何もしない)。素の左クリックだけを横取りして右分割で開く。
+        // キャプチャ段階で拾うことで、コアや他プラグインのバブルハンドラより先に処理する。
+        this.registerDomEvent(document, 'click', this.onCanvasLabelClickCapture, true);
+        this.updateBodyClass();
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+        this.updateBodyClass();
+    }
+
+    private updateBodyClass() {
+        document.body.toggleClass('note-masonry-canvas-label-split', this.settings.canvasLabelSplitEnabled);
+    }
+
+    onunload() {
+        document.body.removeClass('note-masonry-canvas-label-split');
+    }
+
+    /**
+     * Canvasカード左上のファイル名ラベル(.canvas-node-label)の素の左クリックを、
+     * 右側の分割ペインで開く動作に変える。修飾キー付き・中クリックはコアに任せる。
+     */
+    private onCanvasLabelClickCapture = (evt: MouseEvent) => {
+        if (!this.settings.canvasLabelSplitEnabled) return;
+        if (evt.button !== 0) return;
+        if (evt.metaKey || evt.ctrlKey || evt.shiftKey || evt.altKey) return;
+        if (evt.defaultPrevented) return;
+        const target = evt.target as Element | null;
+        if (!target || typeof target.closest !== 'function') return;
+        const labelEl = target.closest('.canvas-node-label');
+        if (!labelEl) return;
+        // グループ名やエッジラベル(.canvas-group-label/.canvas-path-label)は対象外。
+        // .canvas-node-label は file/link ノードにだけ作られるが念のため除外する。
+        if (labelEl.closest('.canvas-node-group, .canvas-group-label, .canvas-path-label, .canvas-edge')) return;
+
+        const canvasLeaf = this.app.workspace.getLeavesOfType('canvas')
+            .find((l) => {
+                try {
+                    return l.view.containerEl.contains(target);
+                } catch {
+                    return false;
+                }
+            });
+        if (!canvasLeaf) return;
+        const view = canvasLeaf.view as unknown as { canvas?: { nodes?: Map<string, unknown> }; file?: TFile | null };
+        const nodeEl = labelEl.closest('.canvas-node');
+        let linktext: string | null = null;
+        try {
+            const nodes = view.canvas?.nodes;
+            if (nodes && typeof nodes.values === 'function' && nodeEl) {
+                for (const n of nodes.values()) {
+                    const node = n as { nodeEl?: unknown; url?: unknown; filePath?: unknown; subpath?: unknown };
+                    if (node?.nodeEl !== nodeEl) continue;
+                    // link(URL)カードは対象外。コア同様ブラウザオープンはMod+クリックに任せる。
+                    if (typeof node.url === 'string' && node.url) return;
+                    if (typeof node.filePath === 'string' && node.filePath) {
+                        linktext = node.filePath + (typeof node.subpath === 'string' ? node.subpath : '');
+                    }
+                    break;
+                }
+            }
+        } catch {
+            // フォールバックせず何もしない(誤爆防止)
+        }
+        if (!linktext) return;
+        const sourcePath = view.file instanceof TFile ? view.file.path : '';
+        const dest = this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath);
+        if (!(dest instanceof TFile)) return;
+
+        evt.preventDefault();
+        evt.stopPropagation();
+        void this.openInRightSplit(dest, canvasLeaf);
+    };
+
+    /**
+     * 既存の右側リーフがあれば再利用し、なければ右にvertical分割を作って開く。
+     * 同一ファイルを既に開いているリーフがあればそこを優先してペイン増殖を防ぐ。
+     */
+    private async openInRightSplit(file: TFile, canvasLeaf?: WorkspaceLeaf): Promise<void> {
+        const ws = this.app.workspace;
+        const leaves: WorkspaceLeaf[] = [];
+        ws.iterateRootLeaves((l) => leaves.push(l));
+        let target: WorkspaceLeaf | null = null;
+        if (leaves.length > 1) {
+            try {
+                const same = leaves.find((l) => {
+                    try {
+                        return (l.view as unknown as { file?: TFile }).file?.path === file.path;
+                    } catch {
+                        return false;
+                    }
+                });
+                if (same) {
+                    target = same;
+                } else {
+                    target = leaves.find((l) => l !== canvasLeaf) ?? null;
+                }
+            } catch {
+                target = null;
+            }
+        }
+        if (!target) {
+            target = ws.getLeaf('split', 'vertical');
+        }
+        await target.openFile(file);
+        await ws.revealLeaf(target);
     }
 
     async activateView() {
@@ -1031,5 +1155,28 @@ export default class KeepPlugin extends Plugin {
         const leaf = workspace.getLeaf('tab');
         await leaf.setViewState({ type: KEEP_VIEW_TYPE, active: true });
         await workspace.revealLeaf(leaf);
+    }
+}
+
+class NoteMasonrySettingTab extends PluginSettingTab {
+    plugin: KeepPlugin;
+
+    constructor(app: App, plugin: KeepPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+        new Setting(containerEl)
+            .setName('Canvasラベルクリックで右に開く')
+            .setDesc('Canvasのファイル名ラベルを単純クリックで右の分割ペインに開きます(なければ作成)。Cmd/Ctrl+クリックの既定動作は維持されます。')
+            .addToggle((toggle) => toggle
+                .setValue(this.plugin.settings.canvasLabelSplitEnabled)
+                .onChange(async (value) => {
+                    this.plugin.settings.canvasLabelSplitEnabled = value;
+                    await this.plugin.saveSettings();
+                }));
     }
 }

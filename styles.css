@@ -450,3 +450,8 @@
     border: none;
     contain: strict;
 }
+
+/* Canvasのファイル名ラベルを単純クリックで右に開く機能が有効なときはポインタ表示 */
+body.note-masonry-canvas-label-split .canvas-node-label {
+    cursor: pointer;
+}

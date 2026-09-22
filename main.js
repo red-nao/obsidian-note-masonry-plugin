@@ -32,6 +32,9 @@ var import_obsidian = require("obsidian");
 var KEEP_VIEW_TYPE = "keep-view";
 var DEFAULT_TAG_FILTER = "#WIP";
 var RANDOM_FILE_COUNT = 15;
+var DEFAULT_SETTINGS = {
+  canvasLabelSplitEnabled: true
+};
 var NoteEditModal = class {
   constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "") {
     this.editorLeaf = null;
@@ -904,14 +907,145 @@ var CanvasPickerModal = class extends import_obsidian.FuzzySuggestModal {
   }
 };
 var KeepPlugin = class extends import_obsidian.Plugin {
-  onload() {
+  constructor() {
+    super(...arguments);
+    this.settings = { ...DEFAULT_SETTINGS };
+    /**
+     * Canvasカード左上のファイル名ラベル(.canvas-node-label)の素の左クリックを、
+     * 右側の分割ペインで開く動作に変える。修飾キー付き・中クリックはコアに任せる。
+     */
+    this.onCanvasLabelClickCapture = (evt) => {
+      var _a;
+      if (!this.settings.canvasLabelSplitEnabled)
+        return;
+      if (evt.button !== 0)
+        return;
+      if (evt.metaKey || evt.ctrlKey || evt.shiftKey || evt.altKey)
+        return;
+      if (evt.defaultPrevented)
+        return;
+      const target = evt.target;
+      if (!target || typeof target.closest !== "function")
+        return;
+      const labelEl = target.closest(".canvas-node-label");
+      if (!labelEl)
+        return;
+      if (labelEl.closest(".canvas-node-group, .canvas-group-label, .canvas-path-label, .canvas-edge"))
+        return;
+      const canvasLeaf = this.app.workspace.getLeavesOfType("canvas").find((l) => {
+        try {
+          return l.view.containerEl.contains(target);
+        } catch (e) {
+          return false;
+        }
+      });
+      if (!canvasLeaf)
+        return;
+      const view = canvasLeaf.view;
+      const nodeEl = labelEl.closest(".canvas-node");
+      let linktext = null;
+      try {
+        const nodes = (_a = view.canvas) == null ? void 0 : _a.nodes;
+        if (nodes && typeof nodes.values === "function" && nodeEl) {
+          for (const n of nodes.values()) {
+            const node = n;
+            if ((node == null ? void 0 : node.nodeEl) !== nodeEl)
+              continue;
+            if (typeof node.url === "string" && node.url)
+              return;
+            if (typeof node.filePath === "string" && node.filePath) {
+              linktext = node.filePath + (typeof node.subpath === "string" ? node.subpath : "");
+            }
+            break;
+          }
+        }
+      } catch (e) {
+      }
+      if (!linktext)
+        return;
+      const sourcePath = view.file instanceof import_obsidian.TFile ? view.file.path : "";
+      const dest = this.app.metadataCache.getFirstLinkpathDest(linktext, sourcePath);
+      if (!(dest instanceof import_obsidian.TFile))
+        return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      void this.openInRightSplit(dest, canvasLeaf);
+    };
+  }
+  async onload() {
+    await this.loadSettings();
     this.registerView(KEEP_VIEW_TYPE, (leaf) => new KeepView(leaf));
     this.addRibbonIcon("layout-grid", "Open note masonry", () => void this.activateView());
+    this.addSettingTab(new NoteMasonrySettingTab(this.app, this));
+    this.registerDomEvent(document, "click", this.onCanvasLabelClickCapture, true);
+    this.updateBodyClass();
+  }
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.updateBodyClass();
+  }
+  updateBodyClass() {
+    document.body.toggleClass("note-masonry-canvas-label-split", this.settings.canvasLabelSplitEnabled);
+  }
+  onunload() {
+    document.body.removeClass("note-masonry-canvas-label-split");
+  }
+  /**
+   * 既存の右側リーフがあれば再利用し、なければ右にvertical分割を作って開く。
+   * 同一ファイルを既に開いているリーフがあればそこを優先してペイン増殖を防ぐ。
+   */
+  async openInRightSplit(file, canvasLeaf) {
+    var _a;
+    const ws = this.app.workspace;
+    const leaves = [];
+    ws.iterateRootLeaves((l) => leaves.push(l));
+    let target = null;
+    if (leaves.length > 1) {
+      try {
+        const same = leaves.find((l) => {
+          var _a2;
+          try {
+            return ((_a2 = l.view.file) == null ? void 0 : _a2.path) === file.path;
+          } catch (e) {
+            return false;
+          }
+        });
+        if (same) {
+          target = same;
+        } else {
+          target = (_a = leaves.find((l) => l !== canvasLeaf)) != null ? _a : null;
+        }
+      } catch (e) {
+        target = null;
+      }
+    }
+    if (!target) {
+      target = ws.getLeaf("split", "vertical");
+    }
+    await target.openFile(file);
+    await ws.revealLeaf(target);
   }
   async activateView() {
     const { workspace } = this.app;
     const leaf = workspace.getLeaf("tab");
     await leaf.setViewState({ type: KEEP_VIEW_TYPE, active: true });
     await workspace.revealLeaf(leaf);
+  }
+};
+var NoteMasonrySettingTab = class extends import_obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    new import_obsidian.Setting(containerEl).setName("Canvas\u30E9\u30D9\u30EB\u30AF\u30EA\u30C3\u30AF\u3067\u53F3\u306B\u958B\u304F").setDesc("Canvas\u306E\u30D5\u30A1\u30A4\u30EB\u540D\u30E9\u30D9\u30EB\u3092\u5358\u7D14\u30AF\u30EA\u30C3\u30AF\u3067\u53F3\u306E\u5206\u5272\u30DA\u30A4\u30F3\u306B\u958B\u304D\u307E\u3059(\u306A\u3051\u308C\u3070\u4F5C\u6210)\u3002Cmd/Ctrl+\u30AF\u30EA\u30C3\u30AF\u306E\u65E2\u5B9A\u52D5\u4F5C\u306F\u7DAD\u6301\u3055\u308C\u307E\u3059\u3002").addToggle((toggle) => toggle.setValue(this.plugin.settings.canvasLabelSplitEnabled).onChange(async (value) => {
+      this.plugin.settings.canvasLabelSplitEnabled = value;
+      await this.plugin.saveSettings();
+    }));
   }
 };
