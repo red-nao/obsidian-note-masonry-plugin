@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Notice, Plugin, PluginSettingTab, Scope, Setting, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
+import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Modal, Notice, Plugin, PluginSettingTab, Scope, Setting, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
 
 export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
@@ -329,6 +329,10 @@ export class KeepView extends ItemView {
     private leftFilters: HTMLElement | null = null;
     private createButton: HTMLElement | null = null;
     private canvasBanner: HTMLElement | null = null;
+    private selectionBar: HTMLElement | null = null;
+    private selectionCountEl: HTMLElement | null = null;
+    /** 通常モードでの複数選択状態（Vault相対パス集合）。フィルタ変更時はクリアされる */
+    private selectedPaths = new Set<string>();
     private isRendering = false;
     private pendingRender = false;
     private renderTimeout: NodeJS.Timeout | null = null;
@@ -426,6 +430,9 @@ export class KeepView extends ItemView {
         this.isRandomMode = false;
         this.randomFiles = [];
         this.canvasFocusCycle = {};
+        if (this.canvasSourcePath && this.selectedPaths.size > 0) {
+            this.selectedPaths.clear();
+        }
         await super.setState(state, result);
         this.updateCanvasModeUI();
         if (this.searchInput && typeof this.searchQuery === 'string') {
@@ -517,6 +524,8 @@ export class KeepView extends ItemView {
 
         this.canvasBanner = container.createEl('div', { cls: 'keep-canvas-banner' });
         this.canvasBanner.hide();
+
+        this.buildSelectionBar(container);
     
         this.gridContainer = container.createEl('div', { cls: 'keep-grid-wrapper' });
         this.searchWrapperEl = searchWrapper;
@@ -540,6 +549,17 @@ export class KeepView extends ItemView {
             if (f instanceof TFile && this.isScratchFile(f)) return;
             this.requestRender(600);
         }));
+
+        // Escで選択解除（編集モーダル／確認モーダル／ピッカーが開いている間はそちらを優先）
+        // View.scopeは初期値nullのため自前で割り当てる（フォーカス中のみ有効になる）
+        this.scope = new Scope(this.app.scope);
+        this.scope.register(null, 'Escape', () => {
+            if (this.selectedPaths.size === 0) return true;
+            if (KeepView.openModalCount > 0) return true;
+            if (document.body.querySelector('.modal-container')) return true;
+            this.clearSelection();
+            return false;
+        });
 
         this.updateCanvasModeUI();
         void this.cleanupLegacyScratchFiles();
@@ -582,6 +602,105 @@ export class KeepView extends ItemView {
                 this.canvasBanner.hide();
             }
         }
+        this.updateSelectionBar();
+    }
+
+    /** 複数選択バー（通常モード＋選択ありのときだけ表示） */
+    private buildSelectionBar(container: Element) {
+        const bar = container.createEl('div', { cls: 'keep-selection-bar' });
+        this.selectionBar = bar;
+        this.selectionCountEl = bar.createEl('span', { cls: 'keep-selection-count', text: '' });
+        const sendBtn = bar.createEl('button', { cls: 'keep-selection-btn', text: 'Send to Canvas' });
+        sendBtn.addEventListener('click', () => {
+            void this.sendSelectedToCanvas();
+        });
+        const newBtn = bar.createEl('button', { cls: 'keep-selection-btn', text: 'New Canvas' });
+        newBtn.addEventListener('click', () => {
+            void this.createCanvasFromSelected();
+        });
+        const delBtn = bar.createEl('button', { cls: 'keep-selection-btn keep-selection-delete', text: 'Delete' });
+        delBtn.addEventListener('click', () => {
+            void this.deleteSelectedWithConfirm();
+        });
+        const clearBtn = bar.createEl('button', { cls: 'keep-selection-clear', attr: { 'aria-label': 'Clear selection' } });
+        setIcon(clearBtn, 'x');
+        clearBtn.addEventListener('click', () => this.clearSelection());
+        bar.hide();
+    }
+
+    private isSelected(file: TFile): boolean {
+        return this.selectedPaths.has(file.path);
+    }
+
+    private getSelectedFiles(): TFile[] {
+        const out: TFile[] = [];
+        for (const p of this.selectedPaths) {
+            const f = this.app.vault.getAbstractFileByPath(p);
+            if (f instanceof TFile) out.push(f);
+        }
+        return out;
+    }
+
+    private toggleSelection(file: TFile, card?: HTMLElement | null) {
+        if (this.isCanvasMode()) return;
+        if (this.selectedPaths.has(file.path)) {
+            this.selectedPaths.delete(file.path);
+        } else {
+            this.selectedPaths.add(file.path);
+        }
+        if (card) {
+            const selected = this.selectedPaths.has(file.path);
+            card.toggleClass('is-selected', selected);
+            const box = card.querySelector('.keep-select-checkbox');
+            if (box) box.toggleClass('is-checked', selected);
+        } else {
+            this.syncSelectionCards();
+        }
+        this.updateSelectionBar();
+    }
+
+    private clearSelection() {
+        if (this.selectedPaths.size === 0) return;
+        this.selectedPaths.clear();
+        this.syncSelectionCards();
+        this.updateSelectionBar();
+    }
+
+    /** DOM上のカード選択表示を選択集合に合わせる（再描画なしの軽量同期） */
+    private syncSelectionCards() {
+        try {
+            const cards = this.gridContainer?.querySelectorAll('.keep-card');
+            if (!cards) return;
+            cards.forEach((el) => {
+                const path = (el as HTMLElement).getAttr('data-file-path');
+                const selected = !!path && this.selectedPaths.has(path);
+                (el as HTMLElement).toggleClass('is-selected', selected);
+                const box = (el as HTMLElement).querySelector('.keep-select-checkbox');
+                if (box) box.toggleClass('is-checked', selected);
+            });
+        } catch {
+            // ignore
+        }
+    }
+
+    private updateSelectionBar() {
+        if (!this.selectionBar || !this.selectionCountEl) return;
+        const count = this.selectedPaths.size;
+        if (this.isCanvasMode() || count === 0) {
+            this.selectionBar.hide();
+            return;
+        }
+        this.selectionBar.show();
+        this.selectionCountEl.setText(`${count} selected`);
+    }
+
+    /** 右クリック対象の解決。選択中のカード上なら選択全体、未選択上なら単体 */
+    private getBulkTargets(file: TFile): TFile[] {
+        if (this.selectedPaths.has(file.path) && this.selectedPaths.size > 1) {
+            const files = this.getSelectedFiles();
+            if (files.length > 1) return files;
+        }
+        return [file];
     }
 
     private getCanvasSourceFile(): TFile | null {
@@ -935,6 +1054,11 @@ export class KeepView extends ItemView {
             if (filterKey !== this.lastFilterKey) {
                 this.renderLimit = RENDER_INITIAL_LIMIT;
                 this.lastFilterKey = filterKey;
+                // フィルタが変わったら不可視ファイルへの誤操作を防ぐため選択をクリア
+                if (this.selectedPaths.size > 0) {
+                    this.selectedPaths.clear();
+                    this.updateSelectionBar();
+                }
             }
 
             let files: TFile[];
@@ -1005,6 +1129,19 @@ export class KeepView extends ItemView {
             const visible = unpinnedFiles.slice(0, Math.max(0, this.renderLimit - pinnedFiles.length));
             await this.renderCards(visible, unpinnedGrid, contentCache);
             this.setupMoreUI(unpinnedFiles.length, visible.length);
+            // 削除・リネームで消えたパスを掃除
+            if (this.selectedPaths.size > 0) {
+                const alive = new Set(files.map((f) => f.path));
+                let changed = false;
+                for (const p of Array.from(this.selectedPaths)) {
+                    if (!alive.has(p)) {
+                        this.selectedPaths.delete(p);
+                        changed = true;
+                    }
+                }
+                if (changed) this.syncSelectionCards();
+            }
+            this.updateSelectionBar();
 
         } finally {
             this.isRendering = false;
@@ -1558,18 +1695,39 @@ export class KeepView extends ItemView {
                 : snippetText;
 
             const card = fragment.createEl('div', { cls: 'keep-card' });
+            card.setAttr('data-file-path', file.path);
+            if (!canvasMode && this.selectedPaths.has(file.path)) {
+                card.addClass('is-selected');
+            }
             card.draggable = !canvasMode;
             let cardWasDragged = false;
+            let dragWasSelected = false;
             if (!canvasMode) {
                 card.addEventListener('dragstart', (e: DragEvent) => {
                     cardWasDragged = true;
-                    card.addClass('is-dragging');
+                    // 選択中のカードなら選択全体をドラッグ対象にする
+                    const dragTargets = this.getBulkTargets(file);
+                    dragWasSelected = this.selectedPaths.has(file.path);
+                    if (dragTargets.length > 1) {
+                        try {
+                            this.gridContainer?.querySelectorAll('.keep-card.is-selected').forEach((c) => c.addClass('is-dragging'));
+                        } catch {
+                            card.addClass('is-dragging');
+                        }
+                    } else {
+                        card.addClass('is-dragging');
+                    }
                     try {
                         const dm = (this.app as unknown as { dragManager?: {
                             dragFile?: (evt: DragEvent, file: TFile) => unknown;
+                            dragFiles?: (evt: DragEvent, files: TFile[]) => unknown;
                             onDragStart?: (evt: DragEvent, info: unknown) => void;
                         } }).dragManager;
-                        if (dm?.dragFile && dm?.onDragStart) {
+                        if (dragTargets.length > 1 && dm?.dragFiles && dm?.onDragStart) {
+                            // 複数ファイルドラッグ（エクスプローラの複数選択と同じ扱いでCanvasが複数ノード作成する）
+                            const info = dm.dragFiles(e, dragTargets);
+                            if (info) dm.onDragStart(e, info);
+                        } else if (dm?.dragFile && dm?.onDragStart) {
                             // dragFile()はdataTransferにobsidian://URLを積んだ上で内部用ドラッグ情報を返す。
                             // それをonDragStart()に渡さないとCanvasのhandleDrop受け口が
                             // 内部fileドロップとして認識できず、URLのリンクカードになってしまう。
@@ -1585,8 +1743,20 @@ export class KeepView extends ItemView {
                         // 非公開APIが無い/変わってもDnD以外は壊さない
                     }
                 });
-                card.addEventListener('dragend', () => {
-                    card.removeClass('is-dragging');
+                card.addEventListener('dragend', (e: DragEvent) => {
+                    try {
+                        this.gridContainer?.querySelectorAll('.keep-card.is-dragging').forEach((c) => c.removeClass('is-dragging'));
+                    } catch {
+                        card.removeClass('is-dragging');
+                    }
+                    // Canvas等へのドロップ成功後は選択を自動解除（キャンセル時は維持）
+                    if (dragWasSelected && this.selectedPaths.size > 0) {
+                        const dropEffect = e.dataTransfer?.dropEffect;
+                        if (!dropEffect || dropEffect !== 'none') {
+                            this.clearSelection();
+                        }
+                    }
+                    dragWasSelected = false;
                     window.setTimeout(() => { cardWasDragged = false; }, 150);
                 });
             }
@@ -1618,6 +1788,16 @@ export class KeepView extends ItemView {
             });
 
             if (!canvasMode) {
+                const selectBtn = card.createEl('button', {
+                    cls: 'keep-select-checkbox' + (this.selectedPaths.has(file.path) ? ' is-checked' : ''),
+                    attr: { 'aria-label': 'Select card' },
+                });
+                setIcon(selectBtn, 'check');
+                selectBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    this.toggleSelection(file, card);
+                });
                 const pinBtn = card.createEl('button', { cls: 'keep-pin-btn' });
                 setIcon(pinBtn, 'pin');
 
@@ -1684,6 +1864,12 @@ export class KeepView extends ItemView {
                     cardWasDragged = false;
                     return;
                 }
+                if (!canvasMode && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.toggleSelection(file, card);
+                    return;
+                }
                 if (canvasMode && (e.metaKey || e.ctrlKey)) {
                     e.preventDefault();
                     e.stopPropagation();
@@ -1702,27 +1888,53 @@ export class KeepView extends ItemView {
                 card.addEventListener('contextmenu', (e: MouseEvent) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    const targets = this.getBulkTargets(file);
                     const menu = new Menu();
-                    menu.addItem((item) => {
-                        item.setTitle('Send to Canvas')
-                            .setIcon('layout-dashboard')
-                            .onClick(() => void this.sendFileToCanvas(file));
-                    });
-                    menu.addItem((item) => {
-                        item.setTitle('Send to new Canvas')
-                            .setIcon('plus')
-                            .onClick(() => void this.createCanvasAndAdd(file));
-                    });
-                    menu.addSeparator();
-                    menu.addItem((item) => {
-                        item.setTitle('Delete')
-                            .setIcon('trash')
-                            .onClick(() => {
-                                void this.app.fileManager.trashFile(file).then(() => {
-                                    this.requestRender();
+                    if (targets.length > 1) {
+                        menu.addItem((item) => {
+                            item.setTitle(`Send ${targets.length} to Canvas`)
+                                .setIcon('layout-dashboard')
+                                .onClick(() => void this.sendFilesToCanvas(targets));
+                        });
+                        menu.addItem((item) => {
+                            item.setTitle(`Send ${targets.length} to new Canvas`)
+                                .setIcon('plus')
+                                .onClick(() => void this.createCanvasAndAddMultiple(targets));
+                        });
+                        menu.addSeparator();
+                        menu.addItem((item) => {
+                            item.setTitle(`Delete ${targets.length}`)
+                                .setIcon('trash')
+                                .onClick(() => void this.deleteFilesWithConfirm(targets));
+                        });
+                        menu.addSeparator();
+                        menu.addItem((item) => {
+                            item.setTitle('Clear selection')
+                                .setIcon('x')
+                                .onClick(() => this.clearSelection());
+                        });
+                    } else {
+                        menu.addItem((item) => {
+                            item.setTitle('Send to Canvas')
+                                .setIcon('layout-dashboard')
+                                .onClick(() => void this.sendFileToCanvas(file));
+                        });
+                        menu.addItem((item) => {
+                            item.setTitle('Send to new Canvas')
+                                .setIcon('plus')
+                                .onClick(() => void this.createCanvasAndAdd(file));
+                        });
+                        menu.addSeparator();
+                        menu.addItem((item) => {
+                            item.setTitle('Delete')
+                                .setIcon('trash')
+                                .onClick(() => {
+                                    void this.app.fileManager.trashFile(file).then(() => {
+                                        this.requestRender();
+                                    });
                                 });
-                            });
-                    });
+                        });
+                    }
                     menu.showAtMouseEvent(e);
                 });
             }
@@ -1950,24 +2162,50 @@ export class KeepView extends ItemView {
     }
 
     async sendFileToCanvas(file: TFile): Promise<void> {
+        await this.sendFilesToCanvas([file]);
+    }
+
+    /** 選択バー用：選択中ファイルを既存Canvasへ一括送信 */
+    async sendSelectedToCanvas(): Promise<void> {
+        const files = this.getSelectedFiles();
+        if (files.length === 0) {
+            new Notice('選択中のファイルがありません');
+            return;
+        }
+        await this.sendFilesToCanvas(files);
+    }
+
+    /** 選択バー用：選択中ファイルで新規Canvasを1つ作る */
+    async createCanvasFromSelected(): Promise<void> {
+        const files = this.getSelectedFiles();
+        if (files.length === 0) {
+            new Notice('選択中のファイルがありません');
+            return;
+        }
+        await this.createCanvasAndAddMultiple(files);
+    }
+
+    async sendFilesToCanvas(files: TFile[]): Promise<void> {
+        const targets = files.filter((f): f is TFile => f instanceof TFile);
+        if (targets.length === 0) return;
         try {
             const canvasFiles = this.getCanvasFiles();
             if (canvasFiles.length === 0) {
-                await this.createCanvasAndAdd(file);
+                await this.createCanvasAndAddMultiple(targets);
                 return;
             }
             const active = this.getActiveCanvasFile();
             if (active && canvasFiles.some((f) => f.path === active.path)) {
-                await this.addFileToCanvas(active, file);
+                await this.addFilesToCanvas(active, targets);
                 return;
             }
             if (canvasFiles.length === 1) {
-                await this.addFileToCanvas(canvasFiles[0], file);
+                await this.addFilesToCanvas(canvasFiles[0], targets);
                 return;
             }
             const picked = await this.pickCanvasFile(canvasFiles);
             if (!picked) return;
-            await this.addFileToCanvas(picked, file);
+            await this.addFilesToCanvas(picked, targets);
         } catch (e) {
             console.error('Send to Canvas failed', e);
             new Notice('Canvasへの送信に失敗しました');
@@ -1975,6 +2213,12 @@ export class KeepView extends ItemView {
     }
 
     async createCanvasAndAdd(file: TFile): Promise<void> {
+        await this.createCanvasAndAddMultiple([file]);
+    }
+
+    async createCanvasAndAddMultiple(files: TFile[]): Promise<void> {
+        const targets = files.filter((f): f is TFile => f instanceof TFile);
+        if (targets.length === 0) return;
         const baseName = 'Untitled Canvas';
         const folder = this.selectedFolder ? `${this.selectedFolder}/` : '';
         let path = `${folder}${baseName}.canvas`;
@@ -1984,7 +2228,44 @@ export class KeepView extends ItemView {
             counter++;
         }
         const canvasFile = await this.app.vault.create(path, JSON.stringify({ nodes: [], edges: [] }, null, 2));
-        await this.addFileToCanvas(canvasFile, file);
+        await this.addFilesToCanvas(canvasFile, targets);
+    }
+
+    /** 選択バー／右クリック用：件数確認つきでまとめてゴミ箱へ */
+    async deleteSelectedWithConfirm(): Promise<void> {
+        const files = this.getSelectedFiles();
+        await this.deleteFilesWithConfirm(files);
+    }
+
+    async deleteFilesWithConfirm(files: TFile[]): Promise<void> {
+        const targets = files.filter((f): f is TFile => f instanceof TFile);
+        if (targets.length === 0) return;
+        if (targets.length === 1) {
+            const single = targets[0];
+            const ok = await new ConfirmDeleteModal(this.app, [single]).awaitChoice();
+            if (!ok) return;
+        } else {
+            const ok = await new ConfirmDeleteModal(this.app, targets).awaitChoice();
+            if (!ok) return;
+        }
+        let failed = 0;
+        for (const f of targets) {
+            try {
+                await this.app.fileManager.trashFile(f);
+                this.selectedPaths.delete(f.path);
+            } catch (e) {
+                console.warn('Trash failed', f.path, e);
+                failed++;
+            }
+        }
+        this.syncSelectionCards();
+        this.updateSelectionBar();
+        this.requestRender();
+        if (failed > 0) {
+            new Notice(`${targets.length - failed}/${targets.length}件をゴミ箱に移動しました（${failed}件失敗）`);
+        } else if (targets.length > 1) {
+            new Notice(`${targets.length}件をゴミ箱に移動しました`);
+        }
     }
 
     /** 送信先Canvasを開いていればそのタブをアクティブ化し、無ければ新規タブで開く */
@@ -2010,6 +2291,13 @@ export class KeepView extends ItemView {
     }
 
     async addFileToCanvas(canvasFile: TFile, file: TFile): Promise<void> {
+        await this.addFilesToCanvas(canvasFile, [file]);
+    }
+
+    /** 複数ファイルを1回の読み書きでCanvasへ追記し、右端にカスケード配置する */
+    async addFilesToCanvas(canvasFile: TFile, files: TFile[]): Promise<void> {
+        const targets = files.filter((f): f is TFile => f instanceof TFile);
+        if (targets.length === 0) return;
         let raw = '';
         try {
             raw = await this.app.vault.read(canvasFile);
@@ -2025,20 +2313,87 @@ export class KeepView extends ItemView {
         if (!Array.isArray(data.nodes)) data.nodes = [];
         if (!Array.isArray(data.edges)) data.edges = [];
 
-        const { x, y } = this.calcCanvasNewPosition(data.nodes);
-        data.nodes.push({
-            id: this.generateCanvasNodeId(),
-            type: 'file',
-            file: file.path,
-            x,
-            y,
-            width: 400,
-            height: 300,
-        });
+        for (const file of targets) {
+            const { x, y } = this.calcCanvasNewPosition(data.nodes);
+            data.nodes.push({
+                id: this.generateCanvasNodeId(),
+                type: 'file',
+                file: file.path,
+                x,
+                y,
+                width: 400,
+                height: 300,
+            });
+        }
 
         await this.app.vault.modify(canvasFile, JSON.stringify(data, null, 2));
-        new Notice(`Sent ${file.basename} → ${canvasFile.basename}`);
+        if (targets.length === 1) {
+            new Notice(`Sent ${targets[0].basename} → ${canvasFile.basename}`);
+        } else {
+            new Notice(`Sent ${targets.length} files → ${canvasFile.basename}`);
+        }
+        // 送信後は選択を自動解除
+        this.clearSelection();
         await this.revealCanvasFile(canvasFile);
+    }
+}
+
+class ConfirmDeleteModal extends Modal {
+    private files: TFile[];
+    private resolveChoice: ((ok: boolean) => void) | null = null;
+    private decided = false;
+
+    constructor(app: App, files: TFile[]) {
+        super(app);
+        this.files = files;
+    }
+
+    awaitChoice(): Promise<boolean> {
+        return new Promise((resolve) => {
+            this.resolveChoice = resolve;
+            this.open();
+        });
+    }
+
+    private decide(ok: boolean) {
+        if (this.decided) return;
+        this.decided = true;
+        this.close();
+        // close時のonClose二重解決を防ぐため先に解決する
+        const r = this.resolveChoice;
+        this.resolveChoice = null;
+        if (r) r(ok);
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.addClass('keep-confirm-modal');
+        const count = this.files.length;
+        contentEl.createEl('h3', { text: count === 1 ? 'このノートをゴミ箱に移動しますか？' : `${count}件のノートをゴミ箱に移動しますか？` });
+        const list = contentEl.createEl('div', { cls: 'keep-confirm-list' });
+        this.files.slice(0, 10).forEach((f) => {
+            list.createEl('div', { text: f.path, cls: 'keep-confirm-item' });
+        });
+        if (count > 10) {
+            list.createEl('div', { text: `…他 ${count - 10}件`, cls: 'keep-confirm-item keep-confirm-more' });
+        }
+        const btns = contentEl.createEl('div', { cls: 'keep-confirm-btns' });
+        const cancel = btns.createEl('button', { text: 'キャンセル' });
+        cancel.addEventListener('click', () => this.decide(false));
+        const okBtn = btns.createEl('button', { text: count === 1 ? '移動する' : `${count}件移動する`, cls: 'mod-warning' });
+        okBtn.addEventListener('click', () => this.decide(true));
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+        if (!this.decided) {
+            this.decided = true;
+            const r = this.resolveChoice;
+            this.resolveChoice = null;
+            if (r) r(false);
+        }
     }
 }
 

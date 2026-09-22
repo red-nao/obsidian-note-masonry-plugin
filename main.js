@@ -283,6 +283,10 @@ var _KeepView = class extends import_obsidian.ItemView {
     this.leftFilters = null;
     this.createButton = null;
     this.canvasBanner = null;
+    this.selectionBar = null;
+    this.selectionCountEl = null;
+    /** 通常モードでの複数選択状態（Vault相対パス集合）。フィルタ変更時はクリアされる */
+    this.selectedPaths = /* @__PURE__ */ new Set();
     this.isRendering = false;
     this.pendingRender = false;
     this.renderTimeout = null;
@@ -363,6 +367,9 @@ var _KeepView = class extends import_obsidian.ItemView {
     this.isRandomMode = false;
     this.randomFiles = [];
     this.canvasFocusCycle = {};
+    if (this.canvasSourcePath && this.selectedPaths.size > 0) {
+      this.selectedPaths.clear();
+    }
     await super.setState(state, result);
     this.updateCanvasModeUI();
     if (this.searchInput && typeof this.searchQuery === "string") {
@@ -436,6 +443,7 @@ var _KeepView = class extends import_obsidian.ItemView {
     });
     this.canvasBanner = container.createEl("div", { cls: "keep-canvas-banner" });
     this.canvasBanner.hide();
+    this.buildSelectionBar(container);
     this.gridContainer = container.createEl("div", { cls: "keep-grid-wrapper" });
     this.searchWrapperEl = searchWrapper;
     this.registerEvent(this.app.vault.on("create", (f) => {
@@ -461,6 +469,17 @@ var _KeepView = class extends import_obsidian.ItemView {
         return;
       this.requestRender(600);
     }));
+    this.scope = new import_obsidian.Scope(this.app.scope);
+    this.scope.register(null, "Escape", () => {
+      if (this.selectedPaths.size === 0)
+        return true;
+      if (_KeepView.openModalCount > 0)
+        return true;
+      if (document.body.querySelector(".modal-container"))
+        return true;
+      this.clearSelection();
+      return false;
+    });
     this.updateCanvasModeUI();
     void this.cleanupLegacyScratchFiles();
     await this.renderGrid();
@@ -501,6 +520,105 @@ var _KeepView = class extends import_obsidian.ItemView {
         this.canvasBanner.hide();
       }
     }
+    this.updateSelectionBar();
+  }
+  /** 複数選択バー（通常モード＋選択ありのときだけ表示） */
+  buildSelectionBar(container) {
+    const bar = container.createEl("div", { cls: "keep-selection-bar" });
+    this.selectionBar = bar;
+    this.selectionCountEl = bar.createEl("span", { cls: "keep-selection-count", text: "" });
+    const sendBtn = bar.createEl("button", { cls: "keep-selection-btn", text: "Send to Canvas" });
+    sendBtn.addEventListener("click", () => {
+      void this.sendSelectedToCanvas();
+    });
+    const newBtn = bar.createEl("button", { cls: "keep-selection-btn", text: "New Canvas" });
+    newBtn.addEventListener("click", () => {
+      void this.createCanvasFromSelected();
+    });
+    const delBtn = bar.createEl("button", { cls: "keep-selection-btn keep-selection-delete", text: "Delete" });
+    delBtn.addEventListener("click", () => {
+      void this.deleteSelectedWithConfirm();
+    });
+    const clearBtn = bar.createEl("button", { cls: "keep-selection-clear", attr: { "aria-label": "Clear selection" } });
+    (0, import_obsidian.setIcon)(clearBtn, "x");
+    clearBtn.addEventListener("click", () => this.clearSelection());
+    bar.hide();
+  }
+  isSelected(file) {
+    return this.selectedPaths.has(file.path);
+  }
+  getSelectedFiles() {
+    const out = [];
+    for (const p of this.selectedPaths) {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (f instanceof import_obsidian.TFile)
+        out.push(f);
+    }
+    return out;
+  }
+  toggleSelection(file, card) {
+    if (this.isCanvasMode())
+      return;
+    if (this.selectedPaths.has(file.path)) {
+      this.selectedPaths.delete(file.path);
+    } else {
+      this.selectedPaths.add(file.path);
+    }
+    if (card) {
+      const selected = this.selectedPaths.has(file.path);
+      card.toggleClass("is-selected", selected);
+      const box = card.querySelector(".keep-select-checkbox");
+      if (box)
+        box.toggleClass("is-checked", selected);
+    } else {
+      this.syncSelectionCards();
+    }
+    this.updateSelectionBar();
+  }
+  clearSelection() {
+    if (this.selectedPaths.size === 0)
+      return;
+    this.selectedPaths.clear();
+    this.syncSelectionCards();
+    this.updateSelectionBar();
+  }
+  /** DOM上のカード選択表示を選択集合に合わせる（再描画なしの軽量同期） */
+  syncSelectionCards() {
+    var _a;
+    try {
+      const cards = (_a = this.gridContainer) == null ? void 0 : _a.querySelectorAll(".keep-card");
+      if (!cards)
+        return;
+      cards.forEach((el) => {
+        const path = el.getAttr("data-file-path");
+        const selected = !!path && this.selectedPaths.has(path);
+        el.toggleClass("is-selected", selected);
+        const box = el.querySelector(".keep-select-checkbox");
+        if (box)
+          box.toggleClass("is-checked", selected);
+      });
+    } catch (e) {
+    }
+  }
+  updateSelectionBar() {
+    if (!this.selectionBar || !this.selectionCountEl)
+      return;
+    const count = this.selectedPaths.size;
+    if (this.isCanvasMode() || count === 0) {
+      this.selectionBar.hide();
+      return;
+    }
+    this.selectionBar.show();
+    this.selectionCountEl.setText(`${count} selected`);
+  }
+  /** 右クリック対象の解決。選択中のカード上なら選択全体、未選択上なら単体 */
+  getBulkTargets(file) {
+    if (this.selectedPaths.has(file.path) && this.selectedPaths.size > 1) {
+      const files = this.getSelectedFiles();
+      if (files.length > 1)
+        return files;
+    }
+    return [file];
   }
   getCanvasSourceFile() {
     if (!this.canvasSourcePath)
@@ -848,6 +966,10 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       if (filterKey !== this.lastFilterKey) {
         this.renderLimit = RENDER_INITIAL_LIMIT;
         this.lastFilterKey = filterKey;
+        if (this.selectedPaths.size > 0) {
+          this.selectedPaths.clear();
+          this.updateSelectionBar();
+        }
       }
       let files;
       const contentCache = /* @__PURE__ */ new Map();
@@ -909,6 +1031,19 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       const visible = unpinnedFiles.slice(0, Math.max(0, this.renderLimit - pinnedFiles.length));
       await this.renderCards(visible, unpinnedGrid, contentCache);
       this.setupMoreUI(unpinnedFiles.length, visible.length);
+      if (this.selectedPaths.size > 0) {
+        const alive = new Set(files.map((f) => f.path));
+        let changed = false;
+        for (const p of Array.from(this.selectedPaths)) {
+          if (!alive.has(p)) {
+            this.selectedPaths.delete(p);
+            changed = true;
+          }
+        }
+        if (changed)
+          this.syncSelectionCards();
+      }
+      this.updateSelectionBar();
     } finally {
       this.isRendering = false;
       if (this.pendingRender) {
@@ -1436,15 +1571,35 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       const snippetText = isMd ? contentWithoutFrontmatter.replace(/!\[.*?\]\(.*?\)|!\[\[.*?\]\]/g, "").trim() : `${file.extension.toUpperCase()} \u2022 ${file.path}`;
       const snippet = isMd ? snippetText.substring(0, 250) + (snippetText.length > 250 ? "..." : "") : snippetText;
       const card = fragment.createEl("div", { cls: "keep-card" });
+      card.setAttr("data-file-path", file.path);
+      if (!canvasMode && this.selectedPaths.has(file.path)) {
+        card.addClass("is-selected");
+      }
       card.draggable = !canvasMode;
       let cardWasDragged = false;
+      let dragWasSelected = false;
       if (!canvasMode) {
         card.addEventListener("dragstart", (e) => {
+          var _a2;
           cardWasDragged = true;
-          card.addClass("is-dragging");
+          const dragTargets = this.getBulkTargets(file);
+          dragWasSelected = this.selectedPaths.has(file.path);
+          if (dragTargets.length > 1) {
+            try {
+              (_a2 = this.gridContainer) == null ? void 0 : _a2.querySelectorAll(".keep-card.is-selected").forEach((c) => c.addClass("is-dragging"));
+            } catch (e2) {
+              card.addClass("is-dragging");
+            }
+          } else {
+            card.addClass("is-dragging");
+          }
           try {
             const dm = this.app.dragManager;
-            if ((dm == null ? void 0 : dm.dragFile) && (dm == null ? void 0 : dm.onDragStart)) {
+            if (dragTargets.length > 1 && (dm == null ? void 0 : dm.dragFiles) && (dm == null ? void 0 : dm.onDragStart)) {
+              const info = dm.dragFiles(e, dragTargets);
+              if (info)
+                dm.onDragStart(e, info);
+            } else if ((dm == null ? void 0 : dm.dragFile) && (dm == null ? void 0 : dm.onDragStart)) {
               const info = dm.dragFile(e, file);
               if (info)
                 dm.onDragStart(e, info);
@@ -1460,8 +1615,20 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
           } catch (e2) {
           }
         });
-        card.addEventListener("dragend", () => {
-          card.removeClass("is-dragging");
+        card.addEventListener("dragend", (e) => {
+          var _a2, _b;
+          try {
+            (_a2 = this.gridContainer) == null ? void 0 : _a2.querySelectorAll(".keep-card.is-dragging").forEach((c) => c.removeClass("is-dragging"));
+          } catch (e2) {
+            card.removeClass("is-dragging");
+          }
+          if (dragWasSelected && this.selectedPaths.size > 0) {
+            const dropEffect = (_b = e.dataTransfer) == null ? void 0 : _b.dropEffect;
+            if (!dropEffect || dropEffect !== "none") {
+              this.clearSelection();
+            }
+          }
+          dragWasSelected = false;
           window.setTimeout(() => {
             cardWasDragged = false;
           }, 150);
@@ -1490,6 +1657,16 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
         void leaf.openFile(file);
       });
       if (!canvasMode) {
+        const selectBtn = card.createEl("button", {
+          cls: "keep-select-checkbox" + (this.selectedPaths.has(file.path) ? " is-checked" : ""),
+          attr: { "aria-label": "Select card" }
+        });
+        (0, import_obsidian.setIcon)(selectBtn, "check");
+        selectBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          this.toggleSelection(file, card);
+        });
         const pinBtn = card.createEl("button", { cls: "keep-pin-btn" });
         (0, import_obsidian.setIcon)(pinBtn, "pin");
         const svg = pinBtn.querySelector("svg");
@@ -1544,6 +1721,12 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
           cardWasDragged = false;
           return;
         }
+        if (!canvasMode && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          e.stopPropagation();
+          this.toggleSelection(file, card);
+          return;
+        }
         if (canvasMode && (e.metaKey || e.ctrlKey)) {
           e.preventDefault();
           e.stopPropagation();
@@ -1561,21 +1744,39 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
         card.addEventListener("contextmenu", (e) => {
           e.preventDefault();
           e.stopPropagation();
+          const targets = this.getBulkTargets(file);
           const menu = new import_obsidian.Menu();
-          menu.addItem((item) => {
-            item.setTitle("Send to Canvas").setIcon("layout-dashboard").onClick(() => void this.sendFileToCanvas(file));
-          });
-          menu.addItem((item) => {
-            item.setTitle("Send to new Canvas").setIcon("plus").onClick(() => void this.createCanvasAndAdd(file));
-          });
-          menu.addSeparator();
-          menu.addItem((item) => {
-            item.setTitle("Delete").setIcon("trash").onClick(() => {
-              void this.app.fileManager.trashFile(file).then(() => {
-                this.requestRender();
+          if (targets.length > 1) {
+            menu.addItem((item) => {
+              item.setTitle(`Send ${targets.length} to Canvas`).setIcon("layout-dashboard").onClick(() => void this.sendFilesToCanvas(targets));
+            });
+            menu.addItem((item) => {
+              item.setTitle(`Send ${targets.length} to new Canvas`).setIcon("plus").onClick(() => void this.createCanvasAndAddMultiple(targets));
+            });
+            menu.addSeparator();
+            menu.addItem((item) => {
+              item.setTitle(`Delete ${targets.length}`).setIcon("trash").onClick(() => void this.deleteFilesWithConfirm(targets));
+            });
+            menu.addSeparator();
+            menu.addItem((item) => {
+              item.setTitle("Clear selection").setIcon("x").onClick(() => this.clearSelection());
+            });
+          } else {
+            menu.addItem((item) => {
+              item.setTitle("Send to Canvas").setIcon("layout-dashboard").onClick(() => void this.sendFileToCanvas(file));
+            });
+            menu.addItem((item) => {
+              item.setTitle("Send to new Canvas").setIcon("plus").onClick(() => void this.createCanvasAndAdd(file));
+            });
+            menu.addSeparator();
+            menu.addItem((item) => {
+              item.setTitle("Delete").setIcon("trash").onClick(() => {
+                void this.app.fileManager.trashFile(file).then(() => {
+                  this.requestRender();
+                });
               });
             });
-          });
+          }
           menu.showAtMouseEvent(e);
         });
       }
@@ -1798,31 +1999,61 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
     });
   }
   async sendFileToCanvas(file) {
+    await this.sendFilesToCanvas([file]);
+  }
+  /** 選択バー用：選択中ファイルを既存Canvasへ一括送信 */
+  async sendSelectedToCanvas() {
+    const files = this.getSelectedFiles();
+    if (files.length === 0) {
+      new import_obsidian.Notice("\u9078\u629E\u4E2D\u306E\u30D5\u30A1\u30A4\u30EB\u304C\u3042\u308A\u307E\u305B\u3093");
+      return;
+    }
+    await this.sendFilesToCanvas(files);
+  }
+  /** 選択バー用：選択中ファイルで新規Canvasを1つ作る */
+  async createCanvasFromSelected() {
+    const files = this.getSelectedFiles();
+    if (files.length === 0) {
+      new import_obsidian.Notice("\u9078\u629E\u4E2D\u306E\u30D5\u30A1\u30A4\u30EB\u304C\u3042\u308A\u307E\u305B\u3093");
+      return;
+    }
+    await this.createCanvasAndAddMultiple(files);
+  }
+  async sendFilesToCanvas(files) {
+    const targets = files.filter((f) => f instanceof import_obsidian.TFile);
+    if (targets.length === 0)
+      return;
     try {
       const canvasFiles = this.getCanvasFiles();
       if (canvasFiles.length === 0) {
-        await this.createCanvasAndAdd(file);
+        await this.createCanvasAndAddMultiple(targets);
         return;
       }
       const active = this.getActiveCanvasFile();
       if (active && canvasFiles.some((f) => f.path === active.path)) {
-        await this.addFileToCanvas(active, file);
+        await this.addFilesToCanvas(active, targets);
         return;
       }
       if (canvasFiles.length === 1) {
-        await this.addFileToCanvas(canvasFiles[0], file);
+        await this.addFilesToCanvas(canvasFiles[0], targets);
         return;
       }
       const picked = await this.pickCanvasFile(canvasFiles);
       if (!picked)
         return;
-      await this.addFileToCanvas(picked, file);
+      await this.addFilesToCanvas(picked, targets);
     } catch (e) {
       console.error("Send to Canvas failed", e);
       new import_obsidian.Notice("Canvas\u3078\u306E\u9001\u4FE1\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
     }
   }
   async createCanvasAndAdd(file) {
+    await this.createCanvasAndAddMultiple([file]);
+  }
+  async createCanvasAndAddMultiple(files) {
+    const targets = files.filter((f) => f instanceof import_obsidian.TFile);
+    if (targets.length === 0)
+      return;
     const baseName = "Untitled Canvas";
     const folder = this.selectedFolder ? `${this.selectedFolder}/` : "";
     let path = `${folder}${baseName}.canvas`;
@@ -1832,7 +2063,45 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       counter++;
     }
     const canvasFile = await this.app.vault.create(path, JSON.stringify({ nodes: [], edges: [] }, null, 2));
-    await this.addFileToCanvas(canvasFile, file);
+    await this.addFilesToCanvas(canvasFile, targets);
+  }
+  /** 選択バー／右クリック用：件数確認つきでまとめてゴミ箱へ */
+  async deleteSelectedWithConfirm() {
+    const files = this.getSelectedFiles();
+    await this.deleteFilesWithConfirm(files);
+  }
+  async deleteFilesWithConfirm(files) {
+    const targets = files.filter((f) => f instanceof import_obsidian.TFile);
+    if (targets.length === 0)
+      return;
+    if (targets.length === 1) {
+      const single = targets[0];
+      const ok = await new ConfirmDeleteModal(this.app, [single]).awaitChoice();
+      if (!ok)
+        return;
+    } else {
+      const ok = await new ConfirmDeleteModal(this.app, targets).awaitChoice();
+      if (!ok)
+        return;
+    }
+    let failed = 0;
+    for (const f of targets) {
+      try {
+        await this.app.fileManager.trashFile(f);
+        this.selectedPaths.delete(f.path);
+      } catch (e) {
+        console.warn("Trash failed", f.path, e);
+        failed++;
+      }
+    }
+    this.syncSelectionCards();
+    this.updateSelectionBar();
+    this.requestRender();
+    if (failed > 0) {
+      new import_obsidian.Notice(`${targets.length - failed}/${targets.length}\u4EF6\u3092\u30B4\u30DF\u7BB1\u306B\u79FB\u52D5\u3057\u307E\u3057\u305F\uFF08${failed}\u4EF6\u5931\u6557\uFF09`);
+    } else if (targets.length > 1) {
+      new import_obsidian.Notice(`${targets.length}\u4EF6\u3092\u30B4\u30DF\u7BB1\u306B\u79FB\u52D5\u3057\u307E\u3057\u305F`);
+    }
   }
   /** 送信先Canvasを開いていればそのタブをアクティブ化し、無ければ新規タブで開く */
   async revealCanvasFile(canvasFile) {
@@ -1854,6 +2123,13 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
     }
   }
   async addFileToCanvas(canvasFile, file) {
+    await this.addFilesToCanvas(canvasFile, [file]);
+  }
+  /** 複数ファイルを1回の読み書きでCanvasへ追記し、右端にカスケード配置する */
+  async addFilesToCanvas(canvasFile, files) {
+    const targets = files.filter((f) => f instanceof import_obsidian.TFile);
+    if (targets.length === 0)
+      return;
     let raw = "";
     try {
       raw = await this.app.vault.read(canvasFile);
@@ -1870,18 +2146,25 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       data.nodes = [];
     if (!Array.isArray(data.edges))
       data.edges = [];
-    const { x, y } = this.calcCanvasNewPosition(data.nodes);
-    data.nodes.push({
-      id: this.generateCanvasNodeId(),
-      type: "file",
-      file: file.path,
-      x,
-      y,
-      width: 400,
-      height: 300
-    });
+    for (const file of targets) {
+      const { x, y } = this.calcCanvasNewPosition(data.nodes);
+      data.nodes.push({
+        id: this.generateCanvasNodeId(),
+        type: "file",
+        file: file.path,
+        x,
+        y,
+        width: 400,
+        height: 300
+      });
+    }
     await this.app.vault.modify(canvasFile, JSON.stringify(data, null, 2));
-    new import_obsidian.Notice(`Sent ${file.basename} \u2192 ${canvasFile.basename}`);
+    if (targets.length === 1) {
+      new import_obsidian.Notice(`Sent ${targets[0].basename} \u2192 ${canvasFile.basename}`);
+    } else {
+      new import_obsidian.Notice(`Sent ${targets.length} files \u2192 ${canvasFile.basename}`);
+    }
+    this.clearSelection();
     await this.revealCanvasFile(canvasFile);
   }
 };
@@ -1892,6 +2175,60 @@ KeepView.openModalCount = 0;
 KeepView.SHARED_SCRATCH_NAME = "masonry-scratch.md";
 /** 旧形式(canvas名ベース)の残骸掃除はセッション中1回だけ */
 KeepView.legacyScratchCleaned = false;
+var ConfirmDeleteModal = class extends import_obsidian.Modal {
+  constructor(app, files) {
+    super(app);
+    this.resolveChoice = null;
+    this.decided = false;
+    this.files = files;
+  }
+  awaitChoice() {
+    return new Promise((resolve) => {
+      this.resolveChoice = resolve;
+      this.open();
+    });
+  }
+  decide(ok) {
+    if (this.decided)
+      return;
+    this.decided = true;
+    this.close();
+    const r = this.resolveChoice;
+    this.resolveChoice = null;
+    if (r)
+      r(ok);
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("keep-confirm-modal");
+    const count = this.files.length;
+    contentEl.createEl("h3", { text: count === 1 ? "\u3053\u306E\u30CE\u30FC\u30C8\u3092\u30B4\u30DF\u7BB1\u306B\u79FB\u52D5\u3057\u307E\u3059\u304B\uFF1F" : `${count}\u4EF6\u306E\u30CE\u30FC\u30C8\u3092\u30B4\u30DF\u7BB1\u306B\u79FB\u52D5\u3057\u307E\u3059\u304B\uFF1F` });
+    const list = contentEl.createEl("div", { cls: "keep-confirm-list" });
+    this.files.slice(0, 10).forEach((f) => {
+      list.createEl("div", { text: f.path, cls: "keep-confirm-item" });
+    });
+    if (count > 10) {
+      list.createEl("div", { text: `\u2026\u4ED6 ${count - 10}\u4EF6`, cls: "keep-confirm-item keep-confirm-more" });
+    }
+    const btns = contentEl.createEl("div", { cls: "keep-confirm-btns" });
+    const cancel = btns.createEl("button", { text: "\u30AD\u30E3\u30F3\u30BB\u30EB" });
+    cancel.addEventListener("click", () => this.decide(false));
+    const okBtn = btns.createEl("button", { text: count === 1 ? "\u79FB\u52D5\u3059\u308B" : `${count}\u4EF6\u79FB\u52D5\u3059\u308B`, cls: "mod-warning" });
+    okBtn.addEventListener("click", () => this.decide(true));
+  }
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+    if (!this.decided) {
+      this.decided = true;
+      const r = this.resolveChoice;
+      this.resolveChoice = null;
+      if (r)
+        r(false);
+    }
+  }
+};
 var CanvasPickerModal = class extends import_obsidian.FuzzySuggestModal {
   constructor(app, files, onPick) {
     super(app);
