@@ -1,34 +1,167 @@
-import { App, ItemView, Plugin, WorkspaceLeaf, TFile, TFolder, Modal, setIcon, getAllTags } from 'obsidian';
+import { App, ItemView, MarkdownFileInfo, Plugin, Scope, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
 
 export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
 const RANDOM_FILE_COUNT = 15;
 
-class NoteEditModal extends Modal {
+/**
+ * Obsidian標準の Modal はキーボードイベント処理を横取りするため、
+ * 中に埋めたエディタでユーザーのホットキー(コマンド)が発火しない。
+ * 見た目はModalと同じだが Modal クラスを使わない自前オーバーレイにし、
+ * workspace の activeEditor / getActiveViewOfType / getActiveFile を
+ * モーダル内エディタに向けることでホットキーを効かせる。
+ */
+class NoteEditModal {
+    app: App;
+    scope: Scope;
+    containerEl: HTMLElement;
+    modalEl: HTMLElement;
+    contentEl: HTMLElement;
+    private bgEl: HTMLElement;
     file: TFile | null;
     keepLeaf: WorkspaceLeaf;
     editorLeaf: WorkspaceLeaf | null = null;
     onCloseCallback: () => void;
     selectedFolder: string;
     selectedTag: string;
+    private prevActiveEditor: MarkdownFileInfo | null = null;
+    private hasSavedActiveEditor = false;
+    private pushedModalScope = false;
+    private isOpen = false;
+    private origSetActiveLeaf: Workspace['setActiveLeaf'] | null = null;
+    private origGetActiveViewOfType: Workspace['getActiveViewOfType'] | null = null;
+    private origGetActiveFile: Workspace['getActiveFile'] | null = null;
 
     constructor(app: App, file: TFile | null, keepLeaf: WorkspaceLeaf, onCloseCallback: () => void, selectedFolder: string = '', selectedTag: string = '') {
-        super(app);
+        this.app = app;
         this.file = file;
         this.keepLeaf = keepLeaf;
         this.onCloseCallback = onCloseCallback;
         this.selectedFolder = selectedFolder;
         this.selectedTag = selectedTag;
+        // Escで閉じる専用。親をapp.scopeにするので他ホットキーはフォールスルーする。
+        this.scope = new Scope(this.app.scope);
+        this.scope.register(null, "Escape", () => {
+            this.close();
+            return false;
+        });
+        // Modalと同じDOM構造にして既存CSS(.keep-* + 組み込み.modal-*)を再利用する
+        this.containerEl = document.createElement('div');
+        this.containerEl.addClass('modal-container', 'mod-dim');
+        this.bgEl = this.containerEl.createDiv({ cls: 'modal-bg keep-modal-bg' });
+        this.bgEl.addEventListener('click', () => this.close());
+        this.modalEl = this.containerEl.createDiv({ cls: 'modal keep-editor-modal' });
+        this.contentEl = this.modalEl.createDiv({ cls: 'modal-content keep-editor-modal-content' });
+    }
+
+    open() {
+        if (this.isOpen) return;
+        this.isOpen = true;
+        document.body.appendChild(this.containerEl);
+        this.app.keymap.pushScope(this.scope);
+        this.pushedModalScope = true;
+        void this.onOpen();
+    }
+
+    private onModalFocusIn = () => {
+        this.claimActiveEditor();
+    };
+
+    private getEditorView(): (View & Partial<MarkdownFileInfo>) | null {
+        const view = this.editorLeaf?.view;
+        return (view ?? null) as (View & Partial<MarkdownFileInfo>) | null;
+    }
+
+    private isEditorFocused(): boolean {
+        const ae = document.activeElement;
+        return !!ae && !!this.contentEl && this.contentEl.contains(ae);
+    }
+
+    /** デタッチleaf内のviewを activeEditor として振る舞わせる。view.scopeはpushしない(Escを横取りしてモーダルが閉じなくなるため)。ホットキーはmodal scope→app.scopeへのフォールスルーで届く。 */
+    private claimActiveEditor() {
+        const view = this.getEditorView();
+        if (!view) return;
+        if (!this.hasSavedActiveEditor) {
+            this.prevActiveEditor = this.app.workspace.activeEditor;
+            this.hasSavedActiveEditor = true;
+        }
+        if (this.app.workspace.activeEditor !== view) {
+            this.app.workspace.activeEditor = view as MarkdownFileInfo;
+        }
+    }
+
+    private releaseActiveEditor() {
+        const view = this.getEditorView();
+        if (this.hasSavedActiveEditor) {
+            if (!view || this.app.workspace.activeEditor === (view as MarkdownFileInfo)) {
+                this.app.workspace.activeEditor = this.prevActiveEditor;
+            }
+            this.prevActiveEditor = null;
+            this.hasSavedActiveEditor = false;
+        }
+    }
+
+    /**
+     * Obsidianコアは activeEditor が MarkdownView 外にあるとクリアしたり、
+     * getActiveViewOfType/getActiveFile が背後のleafを返すため、
+     * モーダル表示中だけworkspaceの該当箇所をモーダル内に向ける。
+     * 閉じる際に必ず元に戻す。
+     */
+    private patchWorkspace() {
+        const ws = this.app.workspace as Workspace & Record<string, unknown>;
+        if (!this.origSetActiveLeaf) {
+            const orig = ws.setActiveLeaf.bind(ws) as Workspace['setActiveLeaf'];
+            this.origSetActiveLeaf = orig;
+            const self = this;
+            (ws as unknown as Record<string, unknown>).setActiveLeaf = function (leaf: WorkspaceLeaf, ...args: unknown[]) {
+                // エディタ編集中にコアや他処理がactiveを奪うのを防ぐ (Kanban/Embeddable方式)
+                if (self.isOpen && self.isEditorFocused()) return;
+                return (orig as (...a: unknown[]) => unknown).apply(ws, [leaf, ...args]);
+            };
+        }
+        if (!this.origGetActiveViewOfType) {
+            const orig = ws.getActiveViewOfType.bind(ws) as Workspace['getActiveViewOfType'];
+            this.origGetActiveViewOfType = orig;
+            const self = this;
+            (ws as unknown as Record<string, unknown>).getActiveViewOfType = function (type: unknown) {
+                const v = self.editorLeaf?.view;
+                try {
+                    if (self.isOpen && v && v instanceof (type as new (...a: never[]) => unknown)) return v;
+                } catch {
+                    // instanceof失敗時はフォールスルー
+                }
+                return (orig as (...a: unknown[]) => unknown).apply(ws, [type]);
+            };
+        }
+        if (!this.origGetActiveFile) {
+            const orig = ws.getActiveFile.bind(ws) as Workspace['getActiveFile'];
+            this.origGetActiveFile = orig;
+            const self = this;
+            (ws as unknown as Record<string, unknown>).getActiveFile = function () {
+                if (self.isOpen && self.file) return self.file;
+                return (orig as () => unknown).apply(ws);
+            };
+        }
+    }
+
+    private unpatchWorkspace() {
+        const ws = this.app.workspace as unknown as Record<string, unknown>;
+        if (this.origSetActiveLeaf) {
+            ws.setActiveLeaf = this.origSetActiveLeaf;
+            this.origSetActiveLeaf = null;
+        }
+        if (this.origGetActiveViewOfType) {
+            ws.getActiveViewOfType = this.origGetActiveViewOfType;
+            this.origGetActiveViewOfType = null;
+        }
+        if (this.origGetActiveFile) {
+            ws.getActiveFile = this.origGetActiveFile;
+            this.origGetActiveFile = null;
+        }
     }
 
     async onOpen() {
         this.contentEl.empty();
-        this.modalEl.addClass('keep-editor-modal');
-        const modal = this as Modal & { bgEl?: HTMLElement };
-        if (modal.bgEl) {
-            modal.bgEl.addClass('keep-modal-bg');
-        }
-        this.contentEl.addClass('keep-editor-modal-content');
 
         let isNewFile = false;
         if (!this.file) {
@@ -60,12 +193,25 @@ class NoteEditModal extends Modal {
 
         const LeafConstructor = this.keepLeaf.constructor as new (app: App) => WorkspaceLeaf;
         this.editorLeaf = new LeafConstructor(this.app);
-        
+
         const leafEl = (this.editorLeaf as WorkspaceLeaf & { containerEl: HTMLElement }).containerEl;
         this.contentEl.appendChild(leafEl);
-        
+
         if (this.editorLeaf && this.file) {
-            await this.editorLeaf.openFile(this.file);
+            const leaf = this.editorLeaf;
+            await leaf.openFile(this.file);
+            // open中に閉じられていた場合はリーク防止のためdetachして終了
+            if (!this.isOpen || this.editorLeaf !== leaf) {
+                leaf.detach();
+                return;
+            }
+            // モーダル内エディタを activeEditor 化し、view.scope をpushして
+            // エディタ系ホットキー(editorCallback系)が効くようにする。
+            // workspaceが裏でactiveEditorを書き換える場合に備え、focusinで取り直す。
+            // ObsidianコアによるactiveEditorクリアにも耐えるようworkspaceをパッチする。
+            this.patchWorkspace();
+            this.contentEl.addEventListener('focusin', this.onModalFocusIn);
+            this.claimActiveEditor();
             if (isNewFile) {
               setTimeout(() => {
                   const inlineTitle = this.contentEl.querySelector('.inline-title') as HTMLElement;
@@ -89,10 +235,26 @@ class NoteEditModal extends Modal {
         }
     }
 
-    onClose() {
+    close() {
+        if (!this.isOpen) return;
+        this.isOpen = false;
+        this.contentEl.removeEventListener('focusin', this.onModalFocusIn);
+        this.releaseActiveEditor();
+        this.unpatchWorkspace();
+        if (this.pushedModalScope) {
+            try {
+                this.app.keymap.popScope(this.scope);
+            } catch {
+                // 無視
+            }
+            this.pushedModalScope = false;
+        }
         if (this.editorLeaf) {
             this.editorLeaf.detach();
+            this.editorLeaf = null;
         }
+        this.containerEl.remove();
+        this.contentEl.empty();
         this.app.workspace.setActiveLeaf(this.keepLeaf, { focus: true });
         this.onCloseCallback();
     }

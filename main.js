@@ -32,24 +32,139 @@ var import_obsidian = require("obsidian");
 var KEEP_VIEW_TYPE = "keep-view";
 var DEFAULT_TAG_FILTER = "#WIP";
 var RANDOM_FILE_COUNT = 15;
-var NoteEditModal = class extends import_obsidian.Modal {
+var NoteEditModal = class {
   constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "") {
-    super(app);
     this.editorLeaf = null;
+    this.prevActiveEditor = null;
+    this.hasSavedActiveEditor = false;
+    this.pushedModalScope = false;
+    this.isOpen = false;
+    this.origSetActiveLeaf = null;
+    this.origGetActiveViewOfType = null;
+    this.origGetActiveFile = null;
+    this.onModalFocusIn = () => {
+      this.claimActiveEditor();
+    };
+    this.app = app;
     this.file = file;
     this.keepLeaf = keepLeaf;
     this.onCloseCallback = onCloseCallback;
     this.selectedFolder = selectedFolder;
     this.selectedTag = selectedTag;
+    this.scope = new import_obsidian.Scope(this.app.scope);
+    this.scope.register(null, "Escape", () => {
+      this.close();
+      return false;
+    });
+    this.containerEl = document.createElement("div");
+    this.containerEl.addClass("modal-container", "mod-dim");
+    this.bgEl = this.containerEl.createDiv({ cls: "modal-bg keep-modal-bg" });
+    this.bgEl.addEventListener("click", () => this.close());
+    this.modalEl = this.containerEl.createDiv({ cls: "modal keep-editor-modal" });
+    this.contentEl = this.modalEl.createDiv({ cls: "modal-content keep-editor-modal-content" });
+  }
+  open() {
+    if (this.isOpen)
+      return;
+    this.isOpen = true;
+    document.body.appendChild(this.containerEl);
+    this.app.keymap.pushScope(this.scope);
+    this.pushedModalScope = true;
+    void this.onOpen();
+  }
+  getEditorView() {
+    var _a;
+    const view = (_a = this.editorLeaf) == null ? void 0 : _a.view;
+    return view != null ? view : null;
+  }
+  isEditorFocused() {
+    const ae = document.activeElement;
+    return !!ae && !!this.contentEl && this.contentEl.contains(ae);
+  }
+  /** デタッチleaf内のviewを activeEditor として振る舞わせる。view.scopeはpushしない(Escを横取りしてモーダルが閉じなくなるため)。ホットキーはmodal scope→app.scopeへのフォールスルーで届く。 */
+  claimActiveEditor() {
+    const view = this.getEditorView();
+    if (!view)
+      return;
+    if (!this.hasSavedActiveEditor) {
+      this.prevActiveEditor = this.app.workspace.activeEditor;
+      this.hasSavedActiveEditor = true;
+    }
+    if (this.app.workspace.activeEditor !== view) {
+      this.app.workspace.activeEditor = view;
+    }
+  }
+  releaseActiveEditor() {
+    const view = this.getEditorView();
+    if (this.hasSavedActiveEditor) {
+      if (!view || this.app.workspace.activeEditor === view) {
+        this.app.workspace.activeEditor = this.prevActiveEditor;
+      }
+      this.prevActiveEditor = null;
+      this.hasSavedActiveEditor = false;
+    }
+  }
+  /**
+   * Obsidianコアは activeEditor が MarkdownView 外にあるとクリアしたり、
+   * getActiveViewOfType/getActiveFile が背後のleafを返すため、
+   * モーダル表示中だけworkspaceの該当箇所をモーダル内に向ける。
+   * 閉じる際に必ず元に戻す。
+   */
+  patchWorkspace() {
+    const ws = this.app.workspace;
+    if (!this.origSetActiveLeaf) {
+      const orig = ws.setActiveLeaf.bind(ws);
+      this.origSetActiveLeaf = orig;
+      const self = this;
+      ws.setActiveLeaf = function(leaf, ...args) {
+        if (self.isOpen && self.isEditorFocused())
+          return;
+        return orig.apply(ws, [leaf, ...args]);
+      };
+    }
+    if (!this.origGetActiveViewOfType) {
+      const orig = ws.getActiveViewOfType.bind(ws);
+      this.origGetActiveViewOfType = orig;
+      const self = this;
+      ws.getActiveViewOfType = function(type) {
+        var _a;
+        const v = (_a = self.editorLeaf) == null ? void 0 : _a.view;
+        try {
+          if (self.isOpen && v && v instanceof type)
+            return v;
+        } catch (e) {
+        }
+        return orig.apply(ws, [type]);
+      };
+    }
+    if (!this.origGetActiveFile) {
+      const orig = ws.getActiveFile.bind(ws);
+      this.origGetActiveFile = orig;
+      const self = this;
+      ws.getActiveFile = function() {
+        if (self.isOpen && self.file)
+          return self.file;
+        return orig.apply(ws);
+      };
+    }
+  }
+  unpatchWorkspace() {
+    const ws = this.app.workspace;
+    if (this.origSetActiveLeaf) {
+      ws.setActiveLeaf = this.origSetActiveLeaf;
+      this.origSetActiveLeaf = null;
+    }
+    if (this.origGetActiveViewOfType) {
+      ws.getActiveViewOfType = this.origGetActiveViewOfType;
+      this.origGetActiveViewOfType = null;
+    }
+    if (this.origGetActiveFile) {
+      ws.getActiveFile = this.origGetActiveFile;
+      this.origGetActiveFile = null;
+    }
   }
   async onOpen() {
     this.contentEl.empty();
-    this.modalEl.addClass("keep-editor-modal");
-    const modal = this;
-    if (modal.bgEl) {
-      modal.bgEl.addClass("keep-modal-bg");
-    }
-    this.contentEl.addClass("keep-editor-modal-content");
     let isNewFile = false;
     if (!this.file) {
       const basePath = this.selectedFolder ? `${this.selectedFolder}/` : "";
@@ -80,7 +195,15 @@ var NoteEditModal = class extends import_obsidian.Modal {
     const leafEl = this.editorLeaf.containerEl;
     this.contentEl.appendChild(leafEl);
     if (this.editorLeaf && this.file) {
-      await this.editorLeaf.openFile(this.file);
+      const leaf = this.editorLeaf;
+      await leaf.openFile(this.file);
+      if (!this.isOpen || this.editorLeaf !== leaf) {
+        leaf.detach();
+        return;
+      }
+      this.patchWorkspace();
+      this.contentEl.addEventListener("focusin", this.onModalFocusIn);
+      this.claimActiveEditor();
       if (isNewFile) {
         setTimeout(() => {
           const inlineTitle = this.contentEl.querySelector(".inline-title");
@@ -103,10 +226,26 @@ var NoteEditModal = class extends import_obsidian.Modal {
       }
     }
   }
-  onClose() {
+  close() {
+    if (!this.isOpen)
+      return;
+    this.isOpen = false;
+    this.contentEl.removeEventListener("focusin", this.onModalFocusIn);
+    this.releaseActiveEditor();
+    this.unpatchWorkspace();
+    if (this.pushedModalScope) {
+      try {
+        this.app.keymap.popScope(this.scope);
+      } catch (e) {
+      }
+      this.pushedModalScope = false;
+    }
     if (this.editorLeaf) {
       this.editorLeaf.detach();
+      this.editorLeaf = null;
     }
+    this.containerEl.remove();
+    this.contentEl.empty();
     this.app.workspace.setActiveLeaf(this.keepLeaf, { focus: true });
     this.onCloseCallback();
   }
