@@ -36,6 +36,4 @@ Note Masonry is an Obsidian plugin that shows your notes in a **Google Keep–st
 - Use the **trash icon** to delete the note.
 
 ## Known Limitations
-- **Hotkeys in the Modal:** Standard Obsidian hotkeys (e.g., opening the Command Palette, text formatting shortcuts) do not work when editing a note inside the pop-up modal. This is due to an architectural limitation in Obsidian: the editor inside the modal is technically "detached" from the main workspace, so Obsidian does not recognize it as the active target for commands.
-  - **Workaround:** If you want to perform heavy editing or use your custom hotkeys, click the **split pane icon** on the card instead. This opens the note in a standard Obsidian split view where all hotkeys function perfectly.
 - **Mobile Support:** The layout and interactions are designed for desktop; mobile usage is not optimized.

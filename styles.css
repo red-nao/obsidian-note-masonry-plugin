@@ -376,7 +376,7 @@
 
 /* Modal Styles */
 .keep-modal-bg {
-    backdrop-filter: blur(14px);
+    /*backdrop-filter: blur(14px);*/
     background-color: rgba(0, 0, 0, 0.4) !important;
     opacity: 1 !important;
 }
@@ -384,7 +384,7 @@
 .keep-editor-modal {
     width: 90vw !important;
     height: 80vh !important;
-    max-width: 700px !important;
+    max-width: 900px !important;
     max-height: 85vh !important;
     padding: 0 !important;
     overflow: hidden !important;
