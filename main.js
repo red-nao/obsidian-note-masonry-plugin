@@ -65,6 +65,95 @@ function normalizeScratchFolder(raw) {
 function normalizeNewFileFolder(raw) {
   return (raw != null ? raw : "").replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
 }
+var NM_PROPS_TOGGLE_CLASS = "note-masonry-props-toggle";
+var NM_PROPS_SHOWN_CLASS = "nm-props-shown";
+function isFrontmatterCapableFile(file) {
+  return file instanceof import_obsidian.TFile && file.extension === "md";
+}
+function isPropsShown(view) {
+  var _a;
+  try {
+    return !!((_a = view.containerEl) == null ? void 0 : _a.hasClass(NM_PROPS_SHOWN_CLASS));
+  } catch (e) {
+    return false;
+  }
+}
+function syncPropsToggleButton(view) {
+  var _a;
+  try {
+    const btn = (_a = view.containerEl) == null ? void 0 : _a.querySelector(`.${NM_PROPS_TOGGLE_CLASS}`);
+    if (!btn)
+      return;
+    const shown = isPropsShown(view);
+    const label = shown ? "\u30D7\u30ED\u30D1\u30C6\u30A3\u3092\u6298\u308A\u305F\u305F\u3080" : "\u30D7\u30ED\u30D1\u30C6\u30A3\u3092\u5C55\u958B\u3059\u308B";
+    btn.setAttr("aria-label", label);
+    try {
+      btn.setAttr("title", label);
+    } catch (e) {
+    }
+    (0, import_obsidian.setIcon)(btn, shown ? "eye-off" : "eye");
+  } catch (e) {
+  }
+}
+function setPropsShown(view, shown) {
+  var _a;
+  try {
+    (_a = view.containerEl) == null ? void 0 : _a.toggleClass(NM_PROPS_SHOWN_CLASS, shown);
+  } catch (e) {
+  }
+  syncPropsToggleButton(view);
+}
+function placePropsToggleBeforeViewSwitcher(view, btn) {
+  var _a;
+  try {
+    const actionsEl = view.actionsEl instanceof HTMLElement ? view.actionsEl : (_a = view.containerEl) == null ? void 0 : _a.querySelector(".view-actions");
+    if (!actionsEl || btn.parentElement !== actionsEl)
+      return;
+    const selectors = [
+      '.view-action[aria-label*="Current view"]',
+      '.view-action[aria-label*="Reading"]',
+      '.view-action[aria-label*="Editing"]',
+      '.view-action[aria-label*="Preview"]',
+      '.view-action[aria-label*="\u30EA\u30FC\u30C7\u30A3\u30F3\u30B0"]',
+      '.view-action[aria-label*="\u7DE8\u96C6"]',
+      '.view-action[aria-label*="\u30D7\u30EC\u30D3\u30E5\u30FC"]'
+    ];
+    for (const sel of selectors) {
+      const modeBtn = actionsEl.querySelector(sel);
+      if (modeBtn && modeBtn !== btn && modeBtn.parentElement === actionsEl) {
+        actionsEl.insertBefore(btn, modeBtn);
+        return;
+      }
+    }
+  } catch (e) {
+  }
+}
+function ensurePropsToggleButton(view) {
+  var _a;
+  try {
+    const file = view.file;
+    if (!isFrontmatterCapableFile(file))
+      return null;
+    if (typeof view.addAction !== "function")
+      return null;
+    const existing = (_a = view.containerEl) == null ? void 0 : _a.querySelector(`.${NM_PROPS_TOGGLE_CLASS}`);
+    if (existing == null ? void 0 : existing.isConnected) {
+      placePropsToggleBeforeViewSwitcher(view, existing);
+      syncPropsToggleButton(view);
+      return existing;
+    }
+    const btn = view.addAction("eye", "\u30D7\u30ED\u30D1\u30C6\u30A3\u3092\u5C55\u958B\u3059\u308B", () => {
+      setPropsShown(view, !isPropsShown(view));
+    });
+    btn.addClass(NM_PROPS_TOGGLE_CLASS);
+    btn.setAttr("aria-label", "\u30D7\u30ED\u30D1\u30C6\u30A3\u3092\u5C55\u958B\u3059\u308B");
+    placePropsToggleBeforeViewSwitcher(view, btn);
+    syncPropsToggleButton(view);
+    return btn;
+  } catch (e) {
+    return null;
+  }
+}
 var NoteEditModal = class {
   constructor(app, file, keepLeaf, onCloseCallback, selectedFolder = "", selectedTag = "", hideTitle = false) {
     this.editorLeaf = null;
@@ -246,6 +335,17 @@ var NoteEditModal = class {
       this.patchWorkspace();
       this.contentEl.addEventListener("focusin", this.onModalFocusIn);
       this.claimActiveEditor();
+      const ensureModalPropsToggle = () => {
+        if (!this.isOpen || this.editorLeaf !== leaf || !this.file)
+          return;
+        try {
+          ensurePropsToggleButton(leaf.view);
+        } catch (e) {
+        }
+      };
+      ensureModalPropsToggle();
+      window.setTimeout(ensureModalPropsToggle, 250);
+      window.setTimeout(ensureModalPropsToggle, 800);
       if (isNewFile) {
         setTimeout(() => {
           const inlineTitle = this.contentEl.querySelector(".inline-title");
@@ -2659,6 +2759,9 @@ var KeepPlugin = class extends import_obsidian.Plugin {
     this.settings = { ...DEFAULT_SETTINGS };
     this.canvasHeaderActions = /* @__PURE__ */ new Map();
     this.headerUpdateTimer = null;
+    this.propsToggleActions = /* @__PURE__ */ new Map();
+    this.propsHeaderTimer = null;
+    this.propsLastFile = /* @__PURE__ */ new Map();
     /**
      * Canvasカード左上のファイル名ラベル(.canvas-node-label)の素の左クリックを、
      * 右側の分割ペインで開く動作に変える。修飾キー付き・中クリックはコアに任せる。
@@ -2736,11 +2839,23 @@ var KeepPlugin = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleCanvasHeaderUpdate()));
     this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleCanvasHeaderUpdate()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.scheduleCanvasHeaderUpdate()));
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.schedulePropsHeaderUpdate()));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.schedulePropsHeaderUpdate()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.schedulePropsHeaderUpdate()));
     this.app.workspace.onLayoutReady(() => this.updateCanvasHeaderButtons());
+    this.app.workspace.onLayoutReady(() => this.schedulePropsHeaderUpdate());
     this.updateBodyClass();
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    try {
+      const s = this.settings;
+      if ("minimalTagBarEnabled" in s)
+        delete s["minimalTagBarEnabled"];
+      if ("propsAtBottomEnabled" in s)
+        delete s["propsAtBottomEnabled"];
+    } catch (e) {
+    }
   }
   async saveSettings() {
     var _a;
@@ -2776,9 +2891,27 @@ var KeepPlugin = class extends import_obsidian.Plugin {
       }
     }
     this.canvasHeaderActions.clear();
+    for (const el of this.propsToggleActions.values()) {
+      try {
+        el.remove();
+      } catch (e) {
+      }
+    }
+    this.propsToggleActions.clear();
+    this.propsLastFile.clear();
+    try {
+      document.querySelectorAll(`.${NM_PROPS_SHOWN_CLASS}`).forEach((n) => {
+        n.removeClass(NM_PROPS_SHOWN_CLASS);
+      });
+    } catch (e) {
+    }
     if (this.headerUpdateTimer !== null) {
       window.clearTimeout(this.headerUpdateTimer);
       this.headerUpdateTimer = null;
+    }
+    if (this.propsHeaderTimer !== null) {
+      window.clearTimeout(this.propsHeaderTimer);
+      this.propsHeaderTimer = null;
     }
   }
   scheduleCanvasHeaderUpdate() {
@@ -2830,6 +2963,82 @@ var KeepPlugin = class extends import_obsidian.Plugin {
           el.addClass("note-masonry-canvas-filter-btn");
           el.setAttr("aria-label", "\u3053\u306E\u30AD\u30E3\u30F3\u30D0\u30B9\u5185\u306E\u30D5\u30A1\u30A4\u30EB\u3092Card View\u3067\u8868\u793A");
           this.canvasHeaderActions.set(leaf, el);
+        } catch (e) {
+        }
+      }
+    } catch (e) {
+    }
+  }
+  schedulePropsHeaderUpdate() {
+    if (this.propsHeaderTimer !== null) {
+      window.clearTimeout(this.propsHeaderTimer);
+    }
+    this.propsHeaderTimer = window.setTimeout(() => {
+      this.propsHeaderTimer = null;
+      this.updatePropsHeaderButtons();
+    }, 150);
+  }
+  /**
+   * Markdownビューのview-headerにプロパティ表示トグルを注入する。
+   * mdファイルのみ対象（canvas等には出さない）。header再描画で消えるため冪等に再付与する。
+   * ファイル切替時は既定の非表示に戻す。
+   */
+  updatePropsHeaderButtons() {
+    var _a;
+    try {
+      const mdLeaves = this.app.workspace.getLeavesOfType("markdown");
+      const alive = new Set(mdLeaves);
+      for (const [leaf, el] of Array.from(this.propsToggleActions.entries())) {
+        if (!alive.has(leaf)) {
+          this.propsToggleActions.delete(leaf);
+          this.propsLastFile.delete(leaf);
+          continue;
+        }
+        if (!el.isConnected) {
+          this.propsToggleActions.delete(leaf);
+        }
+      }
+      for (const leaf of mdLeaves) {
+        try {
+          const view = leaf.view;
+          if (!view || typeof view.addAction !== "function")
+            continue;
+          const file = view.file;
+          if (!isFrontmatterCapableFile(file)) {
+            const old = this.propsToggleActions.get(leaf);
+            if (old) {
+              try {
+                old.remove();
+              } catch (e) {
+              }
+              this.propsToggleActions.delete(leaf);
+            }
+            this.propsLastFile.delete(leaf);
+            try {
+              (_a = view.containerEl) == null ? void 0 : _a.removeClass(NM_PROPS_SHOWN_CLASS);
+            } catch (e) {
+            }
+            continue;
+          }
+          const last = this.propsLastFile.get(leaf);
+          if (last !== file.path) {
+            const first = last === void 0;
+            this.propsLastFile.set(leaf, file.path);
+            if (!first) {
+              setPropsShown(view, false);
+            }
+          }
+          const tracked = this.propsToggleActions.get(leaf);
+          if (tracked == null ? void 0 : tracked.isConnected) {
+            placePropsToggleBeforeViewSwitcher(view, tracked);
+            syncPropsToggleButton(view);
+            continue;
+          } else if (tracked) {
+            this.propsToggleActions.delete(leaf);
+          }
+          const btn = ensurePropsToggleButton(view);
+          if (btn)
+            this.propsToggleActions.set(leaf, btn);
         } catch (e) {
         }
       }

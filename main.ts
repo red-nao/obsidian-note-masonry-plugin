@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, ItemView, MarkdownFileInfo, Menu, Modal, Notice, Plugin, PluginSettingTab, Scope, Setting, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
+import { App, FuzzySuggestModal, IconName, ItemView, MarkdownFileInfo, Menu, Modal, Notice, Plugin, PluginSettingTab, Scope, Setting, View, Workspace, WorkspaceLeaf, TFile, TFolder, setIcon, getAllTags } from 'obsidian';
 
 export const KEEP_VIEW_TYPE = "keep-view";
 const DEFAULT_TAG_FILTER = "#WIP";
@@ -68,6 +68,112 @@ function normalizeScratchFolder(raw: string): string {
 /** 新規ファイル作成先フォルダ設定値を正規化する。空欄はVault直下（''）として扱う */
 function normalizeNewFileFolder(raw: string): string {
     return (raw ?? '').replace(/\\/g, '/').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
+}
+
+/**
+ * プロパティ表示トグル: Markdownビューのview-headerに「プロパティを展開する」ボタンを置き、
+ * .metadata-container の表示・非表示を切り替える。既定は非表示（CSSで隠す）。
+ * フロントマターを持てるmdファイルのみ対象。canvas等にはボタンを出さない。
+ */
+const NM_PROPS_TOGGLE_CLASS = 'note-masonry-props-toggle';
+const NM_PROPS_SHOWN_CLASS = 'nm-props-shown';
+
+type PropsToggleView = ItemView & {
+    file?: TFile | null;
+    actionsEl?: HTMLElement;
+};
+
+/** フロントマターを記入できるファイルか（mdのみ対象） */
+function isFrontmatterCapableFile(file: unknown): file is TFile {
+    return file instanceof TFile && file.extension === 'md';
+}
+
+function isPropsShown(view: PropsToggleView): boolean {
+    try {
+        return !!view.containerEl?.hasClass(NM_PROPS_SHOWN_CLASS);
+    } catch {
+        return false;
+    }
+}
+
+function syncPropsToggleButton(view: PropsToggleView): void {
+    try {
+        const btn = view.containerEl?.querySelector(`.${NM_PROPS_TOGGLE_CLASS}`) as HTMLElement | null;
+        if (!btn) return;
+        const shown = isPropsShown(view);
+        const label = shown ? 'プロパティを折りたたむ' : 'プロパティを展開する';
+        btn.setAttr('aria-label', label);
+        try {
+            btn.setAttr('title', label);
+        } catch {
+            // ignore
+        }
+        setIcon(btn, (shown ? 'eye-off' : 'eye') as IconName);
+    } catch {
+        // ignore
+    }
+}
+
+function setPropsShown(view: PropsToggleView, shown: boolean): void {
+    try {
+        view.containerEl?.toggleClass(NM_PROPS_SHOWN_CLASS, shown);
+    } catch {
+        // ignore
+    }
+    syncPropsToggleButton(view);
+}
+
+/** view-actions内の読書/編集切替の左隣にボタンを寄せる。見つからなければそのまま */
+function placePropsToggleBeforeViewSwitcher(view: PropsToggleView, btn: HTMLElement): void {
+    try {
+        const actionsEl = (view.actionsEl instanceof HTMLElement)
+            ? view.actionsEl
+            : (view.containerEl?.querySelector('.view-actions') as HTMLElement | null);
+        if (!actionsEl || btn.parentElement !== actionsEl) return;
+        const selectors = [
+            '.view-action[aria-label*="Current view"]',
+            '.view-action[aria-label*="Reading"]',
+            '.view-action[aria-label*="Editing"]',
+            '.view-action[aria-label*="Preview"]',
+            '.view-action[aria-label*="リーディング"]',
+            '.view-action[aria-label*="編集"]',
+            '.view-action[aria-label*="プレビュー"]',
+        ];
+        for (const sel of selectors) {
+            const modeBtn: Element | null = actionsEl.querySelector(sel);
+            if (modeBtn && modeBtn !== btn && modeBtn.parentElement === actionsEl) {
+                actionsEl.insertBefore(btn, modeBtn);
+                return;
+            }
+        }
+    } catch {
+        // ignore
+    }
+}
+
+/** 指定ビューにプロパティトグルボタンを確保する。非mdでは付けない */
+function ensurePropsToggleButton(view: PropsToggleView): HTMLElement | null {
+    try {
+        const file = (view as { file?: unknown }).file;
+        if (!isFrontmatterCapableFile(file)) return null;
+        if (typeof (view as unknown as { addAction?: unknown }).addAction !== 'function') return null;
+        const existing = view.containerEl?.querySelector(`.${NM_PROPS_TOGGLE_CLASS}`) as HTMLElement | null;
+        if (existing?.isConnected) {
+            placePropsToggleBeforeViewSwitcher(view, existing);
+            syncPropsToggleButton(view);
+            return existing;
+        }
+        const btn = (view as ItemView).addAction('eye' as IconName, 'プロパティを展開する', () => {
+            setPropsShown(view, !isPropsShown(view));
+        });
+        btn.addClass(NM_PROPS_TOGGLE_CLASS);
+        btn.setAttr('aria-label', 'プロパティを展開する');
+        placePropsToggleBeforeViewSwitcher(view, btn);
+        syncPropsToggleButton(view);
+        return btn;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -288,6 +394,18 @@ class NoteEditModal {
             this.patchWorkspace();
             this.contentEl.addEventListener('focusin', this.onModalFocusIn);
             this.claimActiveEditor();
+            // モーダル内エディタにもview-headerのプロパティトグルを付ける。非同期描画に備えて数回リトライする
+            const ensureModalPropsToggle = () => {
+                if (!this.isOpen || this.editorLeaf !== leaf || !this.file) return;
+                try {
+                    ensurePropsToggleButton(leaf.view as unknown as PropsToggleView);
+                } catch {
+                    // ignore
+                }
+            };
+            ensureModalPropsToggle();
+            window.setTimeout(ensureModalPropsToggle, 250);
+            window.setTimeout(ensureModalPropsToggle, 800);
             if (isNewFile) {
               setTimeout(() => {
                   const inlineTitle = this.contentEl.querySelector('.inline-title') as HTMLElement;
@@ -2858,6 +2976,9 @@ export default class KeepPlugin extends Plugin {
     settings: NoteMasonrySettings = { ...DEFAULT_SETTINGS };
     private canvasHeaderActions = new Map<WorkspaceLeaf, HTMLElement>();
     private headerUpdateTimer: number | null = null;
+    private propsToggleActions = new Map<WorkspaceLeaf, HTMLElement>();
+    private propsHeaderTimer: number | null = null;
+    private propsLastFile = new Map<WorkspaceLeaf, string>();
 
     async onload() {
         await this.loadSettings();
@@ -2876,12 +2997,24 @@ export default class KeepPlugin extends Plugin {
         this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scheduleCanvasHeaderUpdate()));
         this.registerEvent(this.app.workspace.on('layout-change', () => this.scheduleCanvasHeaderUpdate()));
         this.registerEvent(this.app.workspace.on('file-open', () => this.scheduleCanvasHeaderUpdate()));
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.schedulePropsHeaderUpdate()));
+        this.registerEvent(this.app.workspace.on('layout-change', () => this.schedulePropsHeaderUpdate()));
+        this.registerEvent(this.app.workspace.on('file-open', () => this.schedulePropsHeaderUpdate()));
         this.app.workspace.onLayoutReady(() => this.updateCanvasHeaderButtons());
+        this.app.workspace.onLayoutReady(() => this.schedulePropsHeaderUpdate());
         this.updateBodyClass();
     }
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        // 旧設定の残骸を掃除する（minimalTagBarEnabled / propsAtBottomEnabledは廃止）
+        try {
+            const s = this.settings as unknown as Record<string, unknown>;
+            if ('minimalTagBarEnabled' in s) delete s['minimalTagBarEnabled'];
+            if ('propsAtBottomEnabled' in s) delete s['propsAtBottomEnabled'];
+        } catch {
+            // ignore
+        }
     }
 
     async saveSettings() {
@@ -2917,9 +3050,25 @@ export default class KeepPlugin extends Plugin {
             try { el.remove(); } catch { /* ignore */ }
         }
         this.canvasHeaderActions.clear();
+        for (const el of this.propsToggleActions.values()) {
+            try { el.remove(); } catch { /* ignore */ }
+        }
+        this.propsToggleActions.clear();
+        this.propsLastFile.clear();
+        try {
+            document.querySelectorAll(`.${NM_PROPS_SHOWN_CLASS}`).forEach((n) => {
+                (n as HTMLElement).removeClass(NM_PROPS_SHOWN_CLASS);
+            });
+        } catch {
+            // ignore
+        }
         if (this.headerUpdateTimer !== null) {
             window.clearTimeout(this.headerUpdateTimer);
             this.headerUpdateTimer = null;
+        }
+        if (this.propsHeaderTimer !== null) {
+            window.clearTimeout(this.propsHeaderTimer);
+            this.propsHeaderTimer = null;
         }
     }
 
@@ -2968,6 +3117,77 @@ export default class KeepPlugin extends Plugin {
                     el.addClass('note-masonry-canvas-filter-btn');
                     el.setAttr('aria-label', 'このキャンバス内のファイルをCard Viewで表示');
                     this.canvasHeaderActions.set(leaf, el);
+                } catch {
+                    // 1leafの失敗で全体を止めない
+                }
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    private schedulePropsHeaderUpdate() {
+        if (this.propsHeaderTimer !== null) {
+            window.clearTimeout(this.propsHeaderTimer);
+        }
+        this.propsHeaderTimer = window.setTimeout(() => {
+            this.propsHeaderTimer = null;
+            this.updatePropsHeaderButtons();
+        }, 150);
+    }
+
+    /**
+     * Markdownビューのview-headerにプロパティ表示トグルを注入する。
+     * mdファイルのみ対象（canvas等には出さない）。header再描画で消えるため冪等に再付与する。
+     * ファイル切替時は既定の非表示に戻す。
+     */
+    private updatePropsHeaderButtons() {
+        try {
+            const mdLeaves = this.app.workspace.getLeavesOfType('markdown');
+            const alive = new Set(mdLeaves);
+            for (const [leaf, el] of Array.from(this.propsToggleActions.entries())) {
+                if (!alive.has(leaf)) {
+                    this.propsToggleActions.delete(leaf);
+                    this.propsLastFile.delete(leaf);
+                    continue;
+                }
+                if (!el.isConnected) {
+                    this.propsToggleActions.delete(leaf);
+                }
+            }
+            for (const leaf of mdLeaves) {
+                try {
+                    const view = leaf.view as unknown as PropsToggleView;
+                    if (!view || typeof (view as unknown as { addAction?: unknown }).addAction !== 'function') continue;
+                    const file = (view as { file?: unknown }).file;
+                    if (!isFrontmatterCapableFile(file)) {
+                        const old = this.propsToggleActions.get(leaf);
+                        if (old) {
+                            try { old.remove(); } catch { /* ignore */ }
+                            this.propsToggleActions.delete(leaf);
+                        }
+                        this.propsLastFile.delete(leaf);
+                        try { view.containerEl?.removeClass(NM_PROPS_SHOWN_CLASS); } catch { /* ignore */ }
+                        continue;
+                    }
+                    const last = this.propsLastFile.get(leaf);
+                    if (last !== file.path) {
+                        const first = last === undefined;
+                        this.propsLastFile.set(leaf, file.path);
+                        if (!first) {
+                            setPropsShown(view, false);
+                        }
+                    }
+                    const tracked = this.propsToggleActions.get(leaf);
+                    if (tracked?.isConnected) {
+                        placePropsToggleBeforeViewSwitcher(view, tracked);
+                        syncPropsToggleButton(view);
+                        continue;
+                    } else if (tracked) {
+                        this.propsToggleActions.delete(leaf);
+                    }
+                    const btn = ensurePropsToggleButton(view);
+                    if (btn) this.propsToggleActions.set(leaf, btn);
                 } catch {
                     // 1leafの失敗で全体を止めない
                 }

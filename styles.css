@@ -772,3 +772,22 @@ button.keep-tag-chip:hover {
     cursor: default;
     border-style: dashed;
 }
+
+/* プロパティ表示トグル: Markdownビューでは既定で .metadata-container を隠し、
+   view-headerのトグルボタンで .nm-props-shown が付いたときだけ表示する。
+   編集ビュー(.markdown-source-view / .cm-sizer内)・閲覧ビュー(.markdown-preview-view)の
+   実DOM構造にマッチさせる。ホバーや埋め込み(.popover / .markdown-embed内)には適用しない。 */
+.workspace-leaf .markdown-source-view .metadata-container,
+.workspace-leaf .markdown-preview-view .metadata-container,
+.workspace-leaf .markdown-preview-section .metadata-container,
+.keep-editor-modal-content .metadata-container {
+    display: none !important;
+}
+
+.workspace-leaf .nm-props-shown .metadata-container,
+.workspace-leaf.nm-props-shown .metadata-container,
+.keep-editor-modal-content .nm-props-shown .metadata-container,
+.keep-editor-modal-content.nm-props-shown .metadata-container {
+    display: block !important;
+}
+
