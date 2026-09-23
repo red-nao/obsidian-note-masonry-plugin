@@ -512,8 +512,12 @@ body.note-masonry-canvas-label-split .canvas-node-label {
 
 .keep-select-checkbox {
     position: absolute;
-    top: 8px;
-    left: 8px;
+    top: 0;
+    left: 0;
+    /* レイアウト上の配置は枠内に残し、描画だけ角中心にずらす。
+       枠外マイナスオフセットだとCSSマルチカラムの列計算が崩れるため */
+    transform: translate(-50%, -50%);
+    z-index: 1;
     width: 22px;
     height: 22px;
     padding: 0;
@@ -523,6 +527,7 @@ body.note-masonry-canvas-label-split .canvas-node-label {
     border-radius: 50%;
     border: 1px solid var(--background-modifier-border);
     background: var(--background-primary);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
     color: transparent;
     cursor: pointer;
     opacity: 0;
@@ -628,4 +633,142 @@ body.note-masonry-canvas-label-split .canvas-node-label {
     justify-content: flex-end;
     gap: 8px;
     margin-top: 12px;
+}
+
+/* タグ一括編集モーダル */
+.keep-tag-modal .keep-tag-search {
+    width: 100%;
+    margin-bottom: 8px;
+}
+
+.keep-tag-create-row {
+    margin-bottom: 8px;
+}
+
+.keep-tag-create-btn {
+    width: 100%;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px dashed var(--background-modifier-border);
+    background: transparent;
+    color: var(--text-accent);
+    cursor: pointer;
+    text-align: left;
+}
+
+.keep-tag-create-btn:hover:not(:disabled) {
+    background-color: var(--background-modifier-hover);
+}
+
+.keep-tag-create-btn:disabled {
+    color: var(--text-error);
+    cursor: not-allowed;
+}
+
+.keep-tag-list {
+    max-height: 260px;
+    overflow-y: auto;
+    border-radius: 8px;
+    background-color: var(--background-secondary);
+    padding: 4px;
+}
+
+.keep-tag-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9em;
+}
+
+.keep-tag-row:hover {
+    background-color: var(--background-modifier-hover);
+}
+
+.keep-tag-row.is-indeterminate .keep-tag-name {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* チェックボックスの描画はObsidian標準に委ねる（サイズ・配置のみ指定） */
+.keep-tag-check {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    margin: 0;
+    cursor: pointer;
+    position: relative;
+}
+
+/* 一部選択（indeterminate）のみアクセント色で上書き。行クラスと:indeterminate疑似クラスの両対応 */
+.keep-tag-row.is-indeterminate .keep-tag-check,
+.keep-tag-check:indeterminate {
+    background-color: var(--interactive-accent);
+    border-color: var(--interactive-accent);
+}
+
+.keep-tag-row.is-indeterminate .keep-tag-check::after,
+.keep-tag-check:indeterminate::after {
+    content: '–';
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    line-height: 1;
+    font-weight: 700;
+    color: var(--text-on-accent, var(--background-primary));
+}
+
+.keep-tag-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-normal);
+}
+
+.keep-tag-hint {
+    flex-shrink: 0;
+    font-size: 0.8em;
+    color: var(--text-muted);
+}
+
+.keep-tag-hint.is-pending {
+    color: var(--text-accent);
+    font-weight: 600;
+}
+
+/* カード上のタグチップ（小さく目立たせない表示） */
+.keep-tag-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 8px;
+}
+
+.keep-tag-chip {
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--background-modifier-border);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 0.75em;
+    line-height: 1.6;
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+button.keep-tag-chip:hover {
+    background-color: var(--background-modifier-hover);
+    color: var(--text-accent);
+}
+
+.keep-tag-chip-more {
+    cursor: default;
+    border-style: dashed;
 }

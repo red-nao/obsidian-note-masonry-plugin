@@ -42,6 +42,23 @@ const DEFAULT_SETTINGS: NoteMasonrySettings = {
     newFileFolder: '',
 };
 
+/** タグ名を正規化する（#なし・前後空白なし）。空文字は無効扱い */
+function normalizeTagName(raw: string): string {
+    return (raw ?? '').trim().replace(/^#+/, '').trim();
+}
+
+/** frontmatterのタグ値（string | string[] | mixed）を#なしタグ配列にほぐす */
+function splitFrontmatterTagValue(v: unknown): string[] {
+    if (v == null) return [];
+    if (Array.isArray(v)) {
+        const out: string[] = [];
+        for (const el of v) out.push(...splitFrontmatterTagValue(el));
+        return out;
+    }
+    if (typeof v !== 'string') return splitFrontmatterTagValue(String(v));
+    return v.split(/[\s,]+/).map(normalizeTagName).filter((t) => t.length > 0);
+}
+
 /** スクラッチフォルダ設定値を正規化する。空なら既定に戻す */
 function normalizeScratchFolder(raw: string): string {
     const cleaned = (raw ?? '').replace(/\\/g, '/').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
@@ -617,6 +634,10 @@ export class KeepView extends ItemView {
         const newBtn = bar.createEl('button', { cls: 'keep-selection-btn', text: 'New Canvas' });
         newBtn.addEventListener('click', () => {
             void this.createCanvasFromSelected();
+        });
+        const tagsBtn = bar.createEl('button', { cls: 'keep-selection-btn', text: 'Tags' });
+        tagsBtn.addEventListener('click', () => {
+            this.openSelectedTagEditor();
         });
         const delBtn = bar.createEl('button', { cls: 'keep-selection-btn keep-selection-delete', text: 'Delete' });
         delBtn.addEventListener('click', () => {
@@ -1839,6 +1860,11 @@ export class KeepView extends ItemView {
                     e.stopPropagation();
                     const menu = new Menu();
                     menu.addItem((item) => {
+                        item.setTitle('Edit tags')
+                            .setIcon('tag')
+                            .onClick(() => this.openTagEditor([file]));
+                    });
+                    menu.addItem((item) => {
                         item.setTitle('Delete')
                             .setIcon('trash')
                             .onClick(() => {
@@ -1857,6 +1883,34 @@ export class KeepView extends ItemView {
             
             if (snippet) {
                 card.createEl('div', { text: snippet, cls: 'keep-card-snippet' });
+            }
+
+            // 通常モードのみ：frontmatterタグを小さなチップで表示（最大5件＋残件数）
+            if (!canvasMode) {
+                const fmTags = this.getFrontmatterTagList(file);
+                if (fmTags.length > 0) {
+                    const chipsEl = card.createEl('div', { cls: 'keep-tag-chips' });
+                    const CHIP_MAX = 5;
+                    fmTags.slice(0, CHIP_MAX).forEach((t) => {
+                        const chip = chipsEl.createEl('button', {
+                            cls: 'keep-tag-chip',
+                            text: `#${t}`,
+                            attr: { title: `Filter by #${t}` },
+                        });
+                        chip.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            this.selectedTag = `#${t}`;
+                            this.exitRandomMode();
+                            this.requestRender(0);
+                        });
+                    });
+                    if (fmTags.length > CHIP_MAX) {
+                        chipsEl.createEl('span', {
+                            cls: 'keep-tag-chip keep-tag-chip-more',
+                            text: `+${fmTags.length - CHIP_MAX}`,
+                        });
+                    }
+                }
             }
 
             card.addEventListener('click', (e: MouseEvent) => {
@@ -1901,6 +1955,11 @@ export class KeepView extends ItemView {
                                 .setIcon('plus')
                                 .onClick(() => void this.createCanvasAndAddMultiple(targets));
                         });
+                        menu.addItem((item) => {
+                            item.setTitle(`Edit tags for ${targets.length}`)
+                                .setIcon('tag')
+                                .onClick(() => this.openTagEditor(targets));
+                        });
                         menu.addSeparator();
                         menu.addItem((item) => {
                             item.setTitle(`Delete ${targets.length}`)
@@ -1923,6 +1982,11 @@ export class KeepView extends ItemView {
                             item.setTitle('Send to new Canvas')
                                 .setIcon('plus')
                                 .onClick(() => void this.createCanvasAndAdd(file));
+                        });
+                        menu.addItem((item) => {
+                            item.setTitle('Edit tags')
+                                .setIcon('tag')
+                                .onClick(() => this.openTagEditor([file]));
                         });
                         menu.addSeparator();
                         menu.addItem((item) => {
@@ -2268,6 +2332,102 @@ export class KeepView extends ItemView {
         }
     }
 
+    /** frontmatterのtags/tagだけを読む（#なし・重複なし・ソート済み）。本文インラインは含めない */
+    private getFrontmatterTagList(file: TFile): string[] {
+        try {
+            const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+            if (!fm) return [];
+            const set = new Set<string>();
+            for (const t of splitFrontmatterTagValue(fm.tags)) set.add(t);
+            for (const t of splitFrontmatterTagValue(fm.tag)) set.add(t);
+            return Array.from(set).sort((a, b) => a.localeCompare(b));
+        } catch {
+            return [];
+        }
+    }
+
+    /** タグ編集モーダルを開く（Markdownのみ対象。非mdは除外して通知する） */
+    openTagEditor(files: TFile[]): void {
+        const targets = files.filter((f): f is TFile => f instanceof TFile && f.extension === 'md');
+        const skipped = files.length - targets.length;
+        if (targets.length === 0) {
+            new Notice('タグ編集はMarkdownファイルのみ対象です');
+            return;
+        }
+        if (skipped > 0) {
+            new Notice(`${skipped}件の非Markdownファイルは対象外です`);
+        }
+        let vaultTags: string[] = [];
+        try {
+            // @ts-ignore - getTagsはバージョンにより公開型に無いが実行時は存在する
+            const keys = Object.keys(this.app.metadataCache.getTags() ?? {});
+            const set = new Set<string>();
+            for (const k of keys) {
+                const t = normalizeTagName(k);
+                if (t) set.add(t);
+            }
+            vaultTags = Array.from(set).sort((a, b) => a.localeCompare(b));
+        } catch {
+            vaultTags = [];
+        }
+        new TagEditModal(
+            this.app,
+            targets,
+            (f) => this.getFrontmatterTagList(f),
+            vaultTags,
+            async (toAdd, toRemove) => {
+                await this.applyTagChanges(targets, toAdd, toRemove);
+            },
+        ).open();
+    }
+
+    openSelectedTagEditor(): void {
+        const files = this.getSelectedFiles();
+        if (files.length === 0) {
+            new Notice('選択中のファイルがありません');
+            return;
+        }
+        this.openTagEditor(files);
+    }
+
+    /** Apply確定時の一括書き込み。ファイルごとに差分だけprocessFrontMatterする */
+    private async applyTagChanges(files: TFile[], toAdd: string[], toRemove: string[]): Promise<void> {
+        const addSet = new Set(toAdd);
+        const removeSet = new Set(toRemove);
+        if (addSet.size === 0 && removeSet.size === 0) return;
+        for (const f of files) {
+            const current = new Set(this.getFrontmatterTagList(f));
+            const needsAdd = [...addSet].filter((t) => !current.has(t));
+            const needsRemove = [...removeSet].filter((t) => current.has(t));
+            if (needsAdd.length === 0 && needsRemove.length === 0) continue;
+            try {
+                await this.app.fileManager.processFrontMatter(f, (fm) => {
+                    const tagsSet = new Set(splitFrontmatterTagValue(fm.tags));
+                    const hadSingular = fm.tag !== undefined;
+                    const singularSet = new Set(splitFrontmatterTagValue(fm.tag));
+                    for (const t of needsRemove) {
+                        tagsSet.delete(t);
+                        singularSet.delete(t);
+                    }
+                    for (const t of needsAdd) {
+                        if (!singularSet.has(t)) tagsSet.add(t);
+                    }
+                    fm.tags = Array.from(tagsSet).sort((a, b) => a.localeCompare(b));
+                    if (hadSingular) {
+                        if (singularSet.size === 0) {
+                            delete fm.tag;
+                        } else {
+                            fm.tag = Array.from(singularSet).sort((a, b) => a.localeCompare(b));
+                        }
+                    }
+                });
+            } catch (e) {
+                console.warn('Apply tags failed', f.path, e);
+            }
+        }
+        this.requestRender();
+    }
+
     /** 送信先Canvasを開いていればそのタブをアクティブ化し、無ければ新規タブで開く */
     private async revealCanvasFile(canvasFile: TFile): Promise<void> {
         try {
@@ -2335,6 +2495,266 @@ export class KeepView extends ItemView {
         // 送信後は選択を自動解除
         this.clearSelection();
         await this.revealCanvasFile(canvasFile);
+    }
+}
+
+type TagTriState = 'checked' | 'unchecked' | 'indeterminate';
+
+/**
+ * 複数ファイルのタグ一括編集モーダル。
+ * 全ファイル共通=チェック、一部=横線(indeterminate)、なし=空欄で表示する。
+ * 横線開始のタグは 横線→チェック→空欄→横線… の3遷移、それ以外はチェック⇄空欄のトグル。
+ * 先頭の検索ボックスで既存タグを絞り込み、存在しなければ新規作成できる。Applyで一括確定する。
+ */
+class TagEditModal extends Modal {
+    private files: TFile[];
+    private readTags: (f: TFile) => string[];
+    private onApply: (toAdd: string[], toRemove: string[]) => Promise<void>;
+    private counts = new Map<string, number>();
+    private initial = new Map<string, TagTriState>();
+    private current = new Map<string, TagTriState>();
+    private order: string[] = [];
+    private filter = '';
+    private listEl: HTMLElement | null = null;
+    private createRowEl: HTMLElement | null = null;
+    private applyBtn: HTMLButtonElement | null = null;
+    private applying = false;
+
+    constructor(
+        app: App,
+        files: TFile[],
+        readTags: (f: TFile) => string[],
+        vaultTags: string[],
+        onApply: (toAdd: string[], toRemove: string[]) => Promise<void>,
+    ) {
+        super(app);
+        this.files = files;
+        this.readTags = readTags;
+        this.onApply = onApply;
+        const union = new Set<string>();
+        for (const f of files) {
+            for (const t of readTags(f)) {
+                union.add(t);
+                this.counts.set(t, (this.counts.get(t) ?? 0) + 1);
+            }
+        }
+        for (const t of vaultTags) union.add(t);
+        this.order = Array.from(union).sort((a, b) => a.localeCompare(b));
+        for (const t of this.order) {
+            const n = this.counts.get(t) ?? 0;
+            const st: TagTriState = n >= files.length && files.length > 0 ? 'checked' : n > 0 ? 'indeterminate' : 'unchecked';
+            this.initial.set(t, st);
+            this.current.set(t, st);
+        }
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.addClass('keep-tag-modal');
+        const n = this.files.length;
+        contentEl.createEl('h3', {
+            text: n === 1 ? `Edit tags — ${this.files[0].basename}` : `Edit tags — ${n} files`,
+        });
+        const search = contentEl.createEl('input', {
+            cls: 'keep-tag-search',
+            attr: { type: 'text', placeholder: 'Search or create tag...' },
+        });
+        search.addEventListener('input', (e) => {
+            this.filter = (e.target as HTMLInputElement).value;
+            this.renderList();
+        });
+        search.addEventListener('keydown', (e: KeyboardEvent) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                this.tryCreateFromFilter();
+            }
+        });
+        // モーダルを開いたら検索にフォーカス
+        window.setTimeout(() => search.focus(), 50);
+        this.createRowEl = contentEl.createEl('div', { cls: 'keep-tag-create-row' });
+        this.listEl = contentEl.createEl('div', { cls: 'keep-tag-list' });
+        const btns = contentEl.createEl('div', { cls: 'keep-confirm-btns' });
+        const cancel = btns.createEl('button', { text: 'キャンセル' });
+        cancel.addEventListener('click', () => this.close());
+        this.applyBtn = btns.createEl('button', { text: 'Apply', cls: 'mod-cta' }) as HTMLButtonElement;
+        this.applyBtn.addEventListener('click', () => void this.handleApply());
+        this.renderList();
+        this.updateApplyState();
+    }
+
+    onClose() {
+        this.contentEl.empty();
+    }
+
+    private matchesFilter(tag: string): boolean {
+        const q = this.filter.trim().replace(/^#+/, '').toLowerCase();
+        if (!q) return true;
+        return tag.toLowerCase().includes(q);
+    }
+
+    private normalizedFilter(): string {
+        return normalizeTagName(this.filter);
+    }
+
+    private tryCreateFromFilter() {
+        const name = this.normalizedFilter();
+        if (!name) return;
+        if (/[\s,]/.test(name)) {
+            new Notice('タグに空白・カンマは使えません');
+            return;
+        }
+        if (this.order.includes(name)) {
+            // 既存タグへの完全一致はその行へスクロールするだけ
+            this.renderList();
+            return;
+        }
+        this.order.push(name);
+        this.order.sort((a, b) => a.localeCompare(b));
+        this.initial.set(name, 'unchecked');
+        this.current.set(name, 'checked');
+        this.renderList();
+        this.updateApplyState();
+    }
+
+    private getChanges(): { toAdd: string[]; toRemove: string[] } {
+        const toAdd: string[] = [];
+        const toRemove: string[] = [];
+        for (const t of this.order) {
+            const init = this.initial.get(t) ?? 'unchecked';
+            const cur = this.current.get(t) ?? 'unchecked';
+            if (cur === 'indeterminate') continue;
+            if (cur === 'checked' && init !== 'checked') toAdd.push(t);
+            if (cur === 'unchecked' && init !== 'unchecked') toRemove.push(t);
+        }
+        return { toAdd, toRemove };
+    }
+
+    private updateApplyState() {
+        if (!this.applyBtn) return;
+        const { toAdd, toRemove } = this.getChanges();
+        const total = toAdd.length + toRemove.length;
+        this.applyBtn.disabled = total === 0 || this.applying;
+        this.applyBtn.setText('Apply');
+    }
+
+    private syncTagRow(row: HTMLElement, box: HTMLInputElement, tag: string) {
+        const state = this.current.get(tag) ?? 'unchecked';
+        if (state === 'checked') {
+            box.checked = true;
+            box.indeterminate = false;
+        } else if (state === 'indeterminate') {
+            box.checked = false;
+            box.indeterminate = true;
+        } else {
+            box.checked = false;
+            box.indeterminate = false;
+        }
+        row.toggleClass('is-indeterminate', state === 'indeterminate');
+        this.updateHint(row, tag);
+    }
+
+    private cycleState(tag: string) {
+        const init = this.initial.get(tag) ?? 'unchecked';
+        const cur = this.current.get(tag) ?? 'unchecked';
+        let next: TagTriState;
+        if (cur === 'indeterminate') next = 'checked';
+        else if (cur === 'checked') next = 'unchecked';
+        else next = init === 'indeterminate' ? 'indeterminate' : 'checked';
+        this.current.set(tag, next);
+        return next;
+    }
+
+    private renderList() {
+        if (!this.listEl || !this.createRowEl) return;
+        const list = this.listEl;
+        const createRow = this.createRowEl;
+        list.empty();
+        createRow.empty();
+        createRow.hide();
+        const name = this.normalizedFilter();
+        if (name && !this.order.includes(name)) {
+            createRow.show();
+            const btn = createRow.createEl('button', {
+                cls: 'keep-tag-create-btn',
+                text: /[\s,]/.test(name) ? `#${name}（空白・カンマは使えません）` : `Create #${name}`,
+            });
+            if (/[\s,]/.test(name)) {
+                btn.disabled = true;
+            } else {
+                btn.addEventListener('click', () => this.tryCreateFromFilter());
+            }
+        }
+        const total = this.files.length;
+        let shown = 0;
+        for (const tag of this.order) {
+            if (!this.matchesFilter(tag)) continue;
+            shown++;
+            // labelだとラベル転送クリックと既定トグルが競合するためdivで行全体を受ける
+            const row = list.createEl('div', { cls: 'keep-tag-row' });
+            const box = row.createEl('input', { cls: 'keep-tag-check', attr: { type: 'checkbox' } }) as HTMLInputElement;
+            // 直接クリックと行クリックのどちらからでも必ず1回だけ遷移させる。
+            // box側でpreventDefault()すると取消時復元がsyncTagRowの書き込みを消すため、
+            // stopPropagation()のみで二重発火を防ぐ（論理状態はcurrentマップ駆動のためpre-toggleとも競合しない）
+            box.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.cycleState(tag);
+                this.syncTagRow(row, box, tag);
+                this.updateApplyState();
+            });
+            row.addEventListener('click', (e) => {
+                e.preventDefault();
+                this.cycleState(tag);
+                this.syncTagRow(row, box, tag);
+                this.updateApplyState();
+            });
+            row.createEl('span', { cls: 'keep-tag-name', text: `#${tag}` });
+            this.syncTagRow(row, box, tag);
+        }
+        if (shown === 0 && !name) {
+            list.createEl('div', { text: 'タグがありません', cls: 'keep-empty-message' });
+        }
+    }
+
+    private updateHint(row: HTMLElement, tag: string) {
+        let hint = row.querySelector('.keep-tag-hint');
+        if (!hint) hint = row.createEl('span', { cls: 'keep-tag-hint' });
+        const n = this.counts.get(tag) ?? 0;
+        const total = this.files.length;
+        const init = this.initial.get(tag) ?? 'unchecked';
+        const state = this.current.get(tag) ?? 'unchecked';
+        let text = '';
+        let pending = false;
+        if (state === 'indeterminate') {
+            text = total > 1 ? `一部 ${n}/${total}` : '';
+        } else if (state !== init) {
+            text = state === 'checked' ? '→ 追加' : '→ 削除';
+            pending = true;
+        } else if (n >= total && total > 1) {
+            text = 'all';
+        }
+        hint.setText(text);
+        hint.toggleClass('is-pending', pending);
+    }
+
+    private async handleApply() {
+        if (this.applying) return;
+        const { toAdd, toRemove } = this.getChanges();
+        if (toAdd.length === 0 && toRemove.length === 0) {
+            this.close();
+            return;
+        }
+        this.applying = true;
+        this.updateApplyState();
+        try {
+            await this.onApply(toAdd, toRemove);
+            this.close();
+        } catch (e) {
+            console.error('Apply tags failed', e);
+            new Notice('タグの反映に失敗しました');
+            this.applying = false;
+            this.updateApplyState();
+        }
     }
 }
 

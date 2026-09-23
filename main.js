@@ -42,6 +42,22 @@ var DEFAULT_SETTINGS = {
   scratchFolder: DEFAULT_SCRATCH_FOLDER,
   newFileFolder: ""
 };
+function normalizeTagName(raw) {
+  return (raw != null ? raw : "").trim().replace(/^#+/, "").trim();
+}
+function splitFrontmatterTagValue(v) {
+  if (v == null)
+    return [];
+  if (Array.isArray(v)) {
+    const out = [];
+    for (const el of v)
+      out.push(...splitFrontmatterTagValue(el));
+    return out;
+  }
+  if (typeof v !== "string")
+    return splitFrontmatterTagValue(String(v));
+  return v.split(/[\s,]+/).map(normalizeTagName).filter((t) => t.length > 0);
+}
 function normalizeScratchFolder(raw) {
   const cleaned = (raw != null ? raw : "").replace(/\\/g, "/").trim().replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
   return cleaned || DEFAULT_SCRATCH_FOLDER;
@@ -534,6 +550,10 @@ var _KeepView = class extends import_obsidian.ItemView {
     const newBtn = bar.createEl("button", { cls: "keep-selection-btn", text: "New Canvas" });
     newBtn.addEventListener("click", () => {
       void this.createCanvasFromSelected();
+    });
+    const tagsBtn = bar.createEl("button", { cls: "keep-selection-btn", text: "Tags" });
+    tagsBtn.addEventListener("click", () => {
+      this.openSelectedTagEditor();
     });
     const delBtn = bar.createEl("button", { cls: "keep-selection-btn keep-selection-delete", text: "Delete" });
     delBtn.addEventListener("click", () => {
@@ -1701,6 +1721,9 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
           e.stopPropagation();
           const menu = new import_obsidian.Menu();
           menu.addItem((item) => {
+            item.setTitle("Edit tags").setIcon("tag").onClick(() => this.openTagEditor([file]));
+          });
+          menu.addItem((item) => {
             item.setTitle("Delete").setIcon("trash").onClick(() => {
               void this.app.fileManager.trashFile(file).then(() => {
                 this.requestRender();
@@ -1715,6 +1738,32 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       }
       if (snippet) {
         card.createEl("div", { text: snippet, cls: "keep-card-snippet" });
+      }
+      if (!canvasMode) {
+        const fmTags = this.getFrontmatterTagList(file);
+        if (fmTags.length > 0) {
+          const chipsEl = card.createEl("div", { cls: "keep-tag-chips" });
+          const CHIP_MAX = 5;
+          fmTags.slice(0, CHIP_MAX).forEach((t) => {
+            const chip = chipsEl.createEl("button", {
+              cls: "keep-tag-chip",
+              text: `#${t}`,
+              attr: { title: `Filter by #${t}` }
+            });
+            chip.addEventListener("click", (e) => {
+              e.stopPropagation();
+              this.selectedTag = `#${t}`;
+              this.exitRandomMode();
+              this.requestRender(0);
+            });
+          });
+          if (fmTags.length > CHIP_MAX) {
+            chipsEl.createEl("span", {
+              cls: "keep-tag-chip keep-tag-chip-more",
+              text: `+${fmTags.length - CHIP_MAX}`
+            });
+          }
+        }
       }
       card.addEventListener("click", (e) => {
         if (cardWasDragged) {
@@ -1753,6 +1802,9 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
             menu.addItem((item) => {
               item.setTitle(`Send ${targets.length} to new Canvas`).setIcon("plus").onClick(() => void this.createCanvasAndAddMultiple(targets));
             });
+            menu.addItem((item) => {
+              item.setTitle(`Edit tags for ${targets.length}`).setIcon("tag").onClick(() => this.openTagEditor(targets));
+            });
             menu.addSeparator();
             menu.addItem((item) => {
               item.setTitle(`Delete ${targets.length}`).setIcon("trash").onClick(() => void this.deleteFilesWithConfirm(targets));
@@ -1767,6 +1819,9 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
             });
             menu.addItem((item) => {
               item.setTitle("Send to new Canvas").setIcon("plus").onClick(() => void this.createCanvasAndAdd(file));
+            });
+            menu.addItem((item) => {
+              item.setTitle("Edit tags").setIcon("tag").onClick(() => this.openTagEditor([file]));
             });
             menu.addSeparator();
             menu.addItem((item) => {
@@ -2103,6 +2158,106 @@ ${(_a = this.canvasSourcePath) != null ? _a : ""}`;
       new import_obsidian.Notice(`${targets.length}\u4EF6\u3092\u30B4\u30DF\u7BB1\u306B\u79FB\u52D5\u3057\u307E\u3057\u305F`);
     }
   }
+  /** frontmatterのtags/tagだけを読む（#なし・重複なし・ソート済み）。本文インラインは含めない */
+  getFrontmatterTagList(file) {
+    var _a;
+    try {
+      const fm = (_a = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter;
+      if (!fm)
+        return [];
+      const set = /* @__PURE__ */ new Set();
+      for (const t of splitFrontmatterTagValue(fm.tags))
+        set.add(t);
+      for (const t of splitFrontmatterTagValue(fm.tag))
+        set.add(t);
+      return Array.from(set).sort((a, b) => a.localeCompare(b));
+    } catch (e) {
+      return [];
+    }
+  }
+  /** タグ編集モーダルを開く（Markdownのみ対象。非mdは除外して通知する） */
+  openTagEditor(files) {
+    var _a;
+    const targets = files.filter((f) => f instanceof import_obsidian.TFile && f.extension === "md");
+    const skipped = files.length - targets.length;
+    if (targets.length === 0) {
+      new import_obsidian.Notice("\u30BF\u30B0\u7DE8\u96C6\u306FMarkdown\u30D5\u30A1\u30A4\u30EB\u306E\u307F\u5BFE\u8C61\u3067\u3059");
+      return;
+    }
+    if (skipped > 0) {
+      new import_obsidian.Notice(`${skipped}\u4EF6\u306E\u975EMarkdown\u30D5\u30A1\u30A4\u30EB\u306F\u5BFE\u8C61\u5916\u3067\u3059`);
+    }
+    let vaultTags = [];
+    try {
+      const keys = Object.keys((_a = this.app.metadataCache.getTags()) != null ? _a : {});
+      const set = /* @__PURE__ */ new Set();
+      for (const k of keys) {
+        const t = normalizeTagName(k);
+        if (t)
+          set.add(t);
+      }
+      vaultTags = Array.from(set).sort((a, b) => a.localeCompare(b));
+    } catch (e) {
+      vaultTags = [];
+    }
+    new TagEditModal(
+      this.app,
+      targets,
+      (f) => this.getFrontmatterTagList(f),
+      vaultTags,
+      async (toAdd, toRemove) => {
+        await this.applyTagChanges(targets, toAdd, toRemove);
+      }
+    ).open();
+  }
+  openSelectedTagEditor() {
+    const files = this.getSelectedFiles();
+    if (files.length === 0) {
+      new import_obsidian.Notice("\u9078\u629E\u4E2D\u306E\u30D5\u30A1\u30A4\u30EB\u304C\u3042\u308A\u307E\u305B\u3093");
+      return;
+    }
+    this.openTagEditor(files);
+  }
+  /** Apply確定時の一括書き込み。ファイルごとに差分だけprocessFrontMatterする */
+  async applyTagChanges(files, toAdd, toRemove) {
+    const addSet = new Set(toAdd);
+    const removeSet = new Set(toRemove);
+    if (addSet.size === 0 && removeSet.size === 0)
+      return;
+    for (const f of files) {
+      const current = new Set(this.getFrontmatterTagList(f));
+      const needsAdd = [...addSet].filter((t) => !current.has(t));
+      const needsRemove = [...removeSet].filter((t) => current.has(t));
+      if (needsAdd.length === 0 && needsRemove.length === 0)
+        continue;
+      try {
+        await this.app.fileManager.processFrontMatter(f, (fm) => {
+          const tagsSet = new Set(splitFrontmatterTagValue(fm.tags));
+          const hadSingular = fm.tag !== void 0;
+          const singularSet = new Set(splitFrontmatterTagValue(fm.tag));
+          for (const t of needsRemove) {
+            tagsSet.delete(t);
+            singularSet.delete(t);
+          }
+          for (const t of needsAdd) {
+            if (!singularSet.has(t))
+              tagsSet.add(t);
+          }
+          fm.tags = Array.from(tagsSet).sort((a, b) => a.localeCompare(b));
+          if (hadSingular) {
+            if (singularSet.size === 0) {
+              delete fm.tag;
+            } else {
+              fm.tag = Array.from(singularSet).sort((a, b) => a.localeCompare(b));
+            }
+          }
+        });
+      } catch (e) {
+        console.warn("Apply tags failed", f.path, e);
+      }
+    }
+    this.requestRender();
+  }
   /** 送信先Canvasを開いていればそのタブをアクティブ化し、無ければ新規タブで開く */
   async revealCanvasFile(canvasFile) {
     try {
@@ -2175,6 +2330,248 @@ KeepView.openModalCount = 0;
 KeepView.SHARED_SCRATCH_NAME = "masonry-scratch.md";
 /** 旧形式(canvas名ベース)の残骸掃除はセッション中1回だけ */
 KeepView.legacyScratchCleaned = false;
+var TagEditModal = class extends import_obsidian.Modal {
+  constructor(app, files, readTags, vaultTags, onApply) {
+    var _a, _b;
+    super(app);
+    this.counts = /* @__PURE__ */ new Map();
+    this.initial = /* @__PURE__ */ new Map();
+    this.current = /* @__PURE__ */ new Map();
+    this.order = [];
+    this.filter = "";
+    this.listEl = null;
+    this.createRowEl = null;
+    this.applyBtn = null;
+    this.applying = false;
+    this.files = files;
+    this.readTags = readTags;
+    this.onApply = onApply;
+    const union = /* @__PURE__ */ new Set();
+    for (const f of files) {
+      for (const t of readTags(f)) {
+        union.add(t);
+        this.counts.set(t, ((_a = this.counts.get(t)) != null ? _a : 0) + 1);
+      }
+    }
+    for (const t of vaultTags)
+      union.add(t);
+    this.order = Array.from(union).sort((a, b) => a.localeCompare(b));
+    for (const t of this.order) {
+      const n = (_b = this.counts.get(t)) != null ? _b : 0;
+      const st = n >= files.length && files.length > 0 ? "checked" : n > 0 ? "indeterminate" : "unchecked";
+      this.initial.set(t, st);
+      this.current.set(t, st);
+    }
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("keep-tag-modal");
+    const n = this.files.length;
+    contentEl.createEl("h3", {
+      text: n === 1 ? `Edit tags \u2014 ${this.files[0].basename}` : `Edit tags \u2014 ${n} files`
+    });
+    const search = contentEl.createEl("input", {
+      cls: "keep-tag-search",
+      attr: { type: "text", placeholder: "Search or create tag..." }
+    });
+    search.addEventListener("input", (e) => {
+      this.filter = e.target.value;
+      this.renderList();
+    });
+    search.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        this.tryCreateFromFilter();
+      }
+    });
+    window.setTimeout(() => search.focus(), 50);
+    this.createRowEl = contentEl.createEl("div", { cls: "keep-tag-create-row" });
+    this.listEl = contentEl.createEl("div", { cls: "keep-tag-list" });
+    const btns = contentEl.createEl("div", { cls: "keep-confirm-btns" });
+    const cancel = btns.createEl("button", { text: "\u30AD\u30E3\u30F3\u30BB\u30EB" });
+    cancel.addEventListener("click", () => this.close());
+    this.applyBtn = btns.createEl("button", { text: "Apply", cls: "mod-cta" });
+    this.applyBtn.addEventListener("click", () => void this.handleApply());
+    this.renderList();
+    this.updateApplyState();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+  matchesFilter(tag) {
+    const q = this.filter.trim().replace(/^#+/, "").toLowerCase();
+    if (!q)
+      return true;
+    return tag.toLowerCase().includes(q);
+  }
+  normalizedFilter() {
+    return normalizeTagName(this.filter);
+  }
+  tryCreateFromFilter() {
+    const name = this.normalizedFilter();
+    if (!name)
+      return;
+    if (/[\s,]/.test(name)) {
+      new import_obsidian.Notice("\u30BF\u30B0\u306B\u7A7A\u767D\u30FB\u30AB\u30F3\u30DE\u306F\u4F7F\u3048\u307E\u305B\u3093");
+      return;
+    }
+    if (this.order.includes(name)) {
+      this.renderList();
+      return;
+    }
+    this.order.push(name);
+    this.order.sort((a, b) => a.localeCompare(b));
+    this.initial.set(name, "unchecked");
+    this.current.set(name, "checked");
+    this.renderList();
+    this.updateApplyState();
+  }
+  getChanges() {
+    var _a, _b;
+    const toAdd = [];
+    const toRemove = [];
+    for (const t of this.order) {
+      const init = (_a = this.initial.get(t)) != null ? _a : "unchecked";
+      const cur = (_b = this.current.get(t)) != null ? _b : "unchecked";
+      if (cur === "indeterminate")
+        continue;
+      if (cur === "checked" && init !== "checked")
+        toAdd.push(t);
+      if (cur === "unchecked" && init !== "unchecked")
+        toRemove.push(t);
+    }
+    return { toAdd, toRemove };
+  }
+  updateApplyState() {
+    if (!this.applyBtn)
+      return;
+    const { toAdd, toRemove } = this.getChanges();
+    const total = toAdd.length + toRemove.length;
+    this.applyBtn.disabled = total === 0 || this.applying;
+    this.applyBtn.setText("Apply");
+  }
+  syncTagRow(row, box, tag) {
+    var _a;
+    const state = (_a = this.current.get(tag)) != null ? _a : "unchecked";
+    if (state === "checked") {
+      box.checked = true;
+      box.indeterminate = false;
+    } else if (state === "indeterminate") {
+      box.checked = false;
+      box.indeterminate = true;
+    } else {
+      box.checked = false;
+      box.indeterminate = false;
+    }
+    row.toggleClass("is-indeterminate", state === "indeterminate");
+    this.updateHint(row, tag);
+  }
+  cycleState(tag) {
+    var _a, _b;
+    const init = (_a = this.initial.get(tag)) != null ? _a : "unchecked";
+    const cur = (_b = this.current.get(tag)) != null ? _b : "unchecked";
+    let next;
+    if (cur === "indeterminate")
+      next = "checked";
+    else if (cur === "checked")
+      next = "unchecked";
+    else
+      next = init === "indeterminate" ? "indeterminate" : "checked";
+    this.current.set(tag, next);
+    return next;
+  }
+  renderList() {
+    if (!this.listEl || !this.createRowEl)
+      return;
+    const list = this.listEl;
+    const createRow = this.createRowEl;
+    list.empty();
+    createRow.empty();
+    createRow.hide();
+    const name = this.normalizedFilter();
+    if (name && !this.order.includes(name)) {
+      createRow.show();
+      const btn = createRow.createEl("button", {
+        cls: "keep-tag-create-btn",
+        text: /[\s,]/.test(name) ? `#${name}\uFF08\u7A7A\u767D\u30FB\u30AB\u30F3\u30DE\u306F\u4F7F\u3048\u307E\u305B\u3093\uFF09` : `Create #${name}`
+      });
+      if (/[\s,]/.test(name)) {
+        btn.disabled = true;
+      } else {
+        btn.addEventListener("click", () => this.tryCreateFromFilter());
+      }
+    }
+    const total = this.files.length;
+    let shown = 0;
+    for (const tag of this.order) {
+      if (!this.matchesFilter(tag))
+        continue;
+      shown++;
+      const row = list.createEl("div", { cls: "keep-tag-row" });
+      const box = row.createEl("input", { cls: "keep-tag-check", attr: { type: "checkbox" } });
+      box.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.cycleState(tag);
+        this.syncTagRow(row, box, tag);
+        this.updateApplyState();
+      });
+      row.addEventListener("click", (e) => {
+        e.preventDefault();
+        this.cycleState(tag);
+        this.syncTagRow(row, box, tag);
+        this.updateApplyState();
+      });
+      row.createEl("span", { cls: "keep-tag-name", text: `#${tag}` });
+      this.syncTagRow(row, box, tag);
+    }
+    if (shown === 0 && !name) {
+      list.createEl("div", { text: "\u30BF\u30B0\u304C\u3042\u308A\u307E\u305B\u3093", cls: "keep-empty-message" });
+    }
+  }
+  updateHint(row, tag) {
+    var _a, _b, _c;
+    let hint = row.querySelector(".keep-tag-hint");
+    if (!hint)
+      hint = row.createEl("span", { cls: "keep-tag-hint" });
+    const n = (_a = this.counts.get(tag)) != null ? _a : 0;
+    const total = this.files.length;
+    const init = (_b = this.initial.get(tag)) != null ? _b : "unchecked";
+    const state = (_c = this.current.get(tag)) != null ? _c : "unchecked";
+    let text = "";
+    let pending = false;
+    if (state === "indeterminate") {
+      text = total > 1 ? `\u4E00\u90E8 ${n}/${total}` : "";
+    } else if (state !== init) {
+      text = state === "checked" ? "\u2192 \u8FFD\u52A0" : "\u2192 \u524A\u9664";
+      pending = true;
+    } else if (n >= total && total > 1) {
+      text = "all";
+    }
+    hint.setText(text);
+    hint.toggleClass("is-pending", pending);
+  }
+  async handleApply() {
+    if (this.applying)
+      return;
+    const { toAdd, toRemove } = this.getChanges();
+    if (toAdd.length === 0 && toRemove.length === 0) {
+      this.close();
+      return;
+    }
+    this.applying = true;
+    this.updateApplyState();
+    try {
+      await this.onApply(toAdd, toRemove);
+      this.close();
+    } catch (e) {
+      console.error("Apply tags failed", e);
+      new import_obsidian.Notice("\u30BF\u30B0\u306E\u53CD\u6620\u306B\u5931\u6557\u3057\u307E\u3057\u305F");
+      this.applying = false;
+      this.updateApplyState();
+    }
+  }
+};
 var ConfirmDeleteModal = class extends import_obsidian.Modal {
   constructor(app, files) {
     super(app);
